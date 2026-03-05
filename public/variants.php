@@ -702,7 +702,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $runtimeOk && $dbOk) {
                                 $scheduleBuild['value'],
                                 time(),
                                 5,
-                                20
+                                0
                             );
                             $message = t('variant_validate_ok', array());
                         } catch (Exception $e) {

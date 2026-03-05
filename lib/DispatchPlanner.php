@@ -98,7 +98,7 @@ class QrsDispatchPlanner
         }
 
         $lookbackCount = self::parseLookbackCount($schedule['lookback'], $interval);
-        if ($lookbackCount > $maxLookback) {
+        if ($maxLookback > 0 && $lookbackCount > $maxLookback) {
             $lookbackCount = $maxLookback;
         }
 
@@ -189,7 +189,7 @@ class QrsDispatchPlanner
         }
 
         $lookbackCount = self::parseLookbackCount($schedule['lookback'], $interval);
-        if ($lookbackCount > $maxLookback) {
+        if ($maxLookback > 0 && $lookbackCount > $maxLookback) {
             $lookbackCount = $maxLookback;
         }
 

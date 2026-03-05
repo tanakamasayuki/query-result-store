@@ -745,7 +745,7 @@ if (!$isChildMode) {
                 $variant['mode'],
                 $variant['schedule_json'],
                 $nowTs,
-                50
+                0
             );
 
             $i = 0;
