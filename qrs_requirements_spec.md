@@ -201,11 +201,24 @@ Primary settings:
 -   `worker.poll_interval_millis`
     -   polling interval for Redash job status (milliseconds)
     -   recommended initial value: `1000`
+-   `worker.running_stale_seconds`
+    -   seconds before reclaiming tasks left in `running` state as `queued_retry`
+    -   recommended initial value: `900`
 
 Termination behavior:
 
 -   after `max_run_seconds`, Worker **stops claiming new jobs**
 -   jobs already moved to `running` are completed before process exit
+
+`running` recovery:
+
+-   on worker startup, records in `running` with `locked_at` older than `running_stale_seconds` are moved to `queued_retry`
+-   clear `locked_by`, `locked_at`, `started_at`, and record an automatic recovery reason in `last_error`
+
+Default rationale:
+
+-   with `poll_timeout_seconds=300`, `running_stale_seconds=900` (3x) is a safe default to avoid false recovery
+-   if faster recovery is preferred, `600` (2x) is also a practical option
 
 Constraints for parallel execution:
 

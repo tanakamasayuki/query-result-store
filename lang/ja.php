@@ -15,6 +15,7 @@ return array(
     'runtime_setting_worker_max_jobs_per_run' => 'Worker 1回実行の最大件数 (worker.max_jobs_per_run)',
     'runtime_setting_worker_poll_timeout_seconds' => 'Redash ポーリングのタイムアウト秒数 (worker.poll_timeout_seconds)',
     'runtime_setting_worker_poll_interval_millis' => 'Redash ポーリング間隔ミリ秒 (worker.poll_interval_millis)',
+    'runtime_setting_worker_running_stale_seconds' => 'running 復旧秒数 (worker.running_stale_seconds)',
     'runtime_settings_save_button' => 'Runtime 設定を保存',
     'runtime_settings_saved' => 'Runtime 設定を保存しました。',
     'runtime_settings_save_error' => 'Runtime 設定の保存に失敗しました: {message}',

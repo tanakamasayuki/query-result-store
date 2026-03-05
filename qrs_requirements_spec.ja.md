@@ -196,11 +196,24 @@ Worker は `qrs_sys_meta` の運用設定を参照して挙動を制御する。
 -   `worker.poll_interval_millis`
     -   Redash ジョブ状態ポーリング間隔（ミリ秒）
     -   推奨初期値: `1000`
+-   `worker.running_stale_seconds`
+    -   `running` 状態のまま停止したタスクを `queued_retry` に戻すまでの秒数
+    -   推奨初期値: `900`
 
 終了条件:
 
 -   `max_run_seconds` 到達後は**新規ジョブを取得しない**
 -   すでに `running` に遷移済みのジョブは完了まで待機してから終了する
+
+`running` 復旧:
+
+-   Worker 起動時に `running` かつ `locked_at` が `running_stale_seconds` を超過したレコードを検出し、`queued_retry` に戻す
+-   `locked_by`, `locked_at`, `started_at` はクリアし、`last_error` に自動復旧理由を記録する
+
+デフォルト値の考え方:
+
+-   `poll_timeout_seconds=300` に対して `running_stale_seconds=900` は 3 倍で、誤回収を避ける安全側設定
+-   復旧を早めたい運用では `600`（2 倍）程度も選択可能
 
 並列実行時の制約:
 

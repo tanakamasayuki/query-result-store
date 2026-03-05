@@ -162,6 +162,7 @@ class QrsDb
                 'worker.max_jobs_per_run' => '20',
                 'worker.poll_timeout_seconds' => '300',
                 'worker.poll_interval_millis' => '1000',
+                'worker.running_stale_seconds' => '900',
             );
             $upsertMetaStmt = $pdo->prepare(
                 'INSERT OR IGNORE INTO qrs_sys_meta (meta_key, meta_value, updated_at) VALUES (:meta_key, :meta_value, :updated_at)'

@@ -144,6 +144,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $runtimeOk && $dbOk) {
                 if ($workerPollIntervalMillis < 100) {
                     $workerPollIntervalMillis = 100;
                 }
+                $workerRunningStaleSeconds = isset($_POST['worker_running_stale_seconds']) ? (int)$_POST['worker_running_stale_seconds'] : 900;
+                if ($workerRunningStaleSeconds < 1) {
+                    $workerRunningStaleSeconds = 1;
+                }
                 $metaRepo->set('runtime.store_raw_redash_payload', $storeRaw);
                 $metaRepo->set('runtime.raw_redash_payload_dir', $rawDir);
                 $metaRepo->set('worker.global_concurrency', (string)$workerGlobalConcurrency);
@@ -151,6 +155,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $runtimeOk && $dbOk) {
                 $metaRepo->set('worker.max_jobs_per_run', (string)$workerMaxJobsPerRun);
                 $metaRepo->set('worker.poll_timeout_seconds', (string)$workerPollTimeoutSeconds);
                 $metaRepo->set('worker.poll_interval_millis', (string)$workerPollIntervalMillis);
+                $metaRepo->set('worker.running_stale_seconds', (string)$workerRunningStaleSeconds);
+                foreach ($_POST as $postKey => $postValue) {
+                    if (strpos($postKey, 'meta_') !== 0) {
+                        continue;
+                    }
+                    $metaKey = substr($postKey, 5);
+                    if (!preg_match('/^[A-Za-z0-9._-]+$/', $metaKey)) {
+                        continue;
+                    }
+                    if (is_array($postValue) || is_object($postValue)) {
+                        continue;
+                    }
+                    $metaRepo->set($metaKey, trim((string)$postValue));
+                }
                 $message = t('runtime_settings_saved', array());
             } catch (Exception $e) {
                 $error = t('runtime_settings_save_error', array('message' => $e->getMessage()));
@@ -196,6 +214,7 @@ $runtimeWorkerMaxRunSeconds = '150';
 $runtimeWorkerMaxJobsPerRun = '20';
 $runtimeWorkerPollTimeoutSeconds = '300';
 $runtimeWorkerPollIntervalMillis = '1000';
+$runtimeWorkerRunningStaleSeconds = '900';
 if ($dbOk && $isInitialized) {
     try {
         $metaRepo = new QrsMetaRepository($pdo);
@@ -226,6 +245,10 @@ if ($dbOk && $isInitialized) {
         $runtimeWorkerPollIntervalMillis = trim($metaRepo->get('worker.poll_interval_millis', '1000'));
         if ($runtimeWorkerPollIntervalMillis === '') {
             $runtimeWorkerPollIntervalMillis = '1000';
+        }
+        $runtimeWorkerRunningStaleSeconds = trim($metaRepo->get('worker.running_stale_seconds', '900'));
+        if ($runtimeWorkerRunningStaleSeconds === '') {
+            $runtimeWorkerRunningStaleSeconds = '900';
         }
     } catch (Exception $e) {
         $error = t('runtime_settings_load_error', array('message' => $e->getMessage()));
@@ -350,6 +373,9 @@ qrs_render_header('env', t('app_title', array()), $message, $error);
 
       <label><?php echo h(t('runtime_setting_worker_poll_interval_millis', array())); ?></label>
       <input type="text" name="worker_poll_interval_millis" value="<?php echo h($runtimeWorkerPollIntervalMillis); ?>">
+
+      <label><?php echo h(t('runtime_setting_worker_running_stale_seconds', array())); ?></label>
+      <input type="text" name="worker_running_stale_seconds" value="<?php echo h($runtimeWorkerRunningStaleSeconds); ?>">
 
       <div style="margin-top:10px;">
         <button type="submit"><?php echo h(t('runtime_settings_save_button', array())); ?></button>

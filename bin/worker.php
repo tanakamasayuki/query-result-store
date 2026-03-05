@@ -435,6 +435,68 @@ function qrs_worker_mark_failed($pdo, $variantId, $bucketAt, $errorMessage)
     ));
 }
 
+function qrs_worker_recover_stale_running($pdo, $staleSeconds)
+{
+    $sec = (int)$staleSeconds;
+    if ($sec <= 0) {
+        $sec = 900;
+    }
+
+    $nowTs = time();
+    $cutoffTs = $nowTs - $sec;
+    $cutoff = date('Y-m-d H:i:s', $cutoffTs);
+    $now = date('Y-m-d H:i:s', $nowTs);
+
+    $selectSql = 'SELECT variant_id, bucket_at, locked_at FROM qrs_sys_buckets '
+        . 'WHERE status = :status AND locked_at IS NOT NULL AND locked_at <= :cutoff';
+    $selectStmt = $pdo->prepare($selectSql);
+    $selectStmt->execute(array(
+        ':status' => 'running',
+        ':cutoff' => $cutoff,
+    ));
+    $rows = $selectStmt->fetchAll();
+
+    if (!is_array($rows) || count($rows) === 0) {
+        return 0;
+    }
+
+    $updateSql = 'UPDATE qrs_sys_buckets '
+        . 'SET status = :status, execute_after = :execute_after, '
+        . 'locked_by = NULL, locked_at = NULL, started_at = NULL, finished_at = NULL, '
+        . 'last_error = :last_error, updated_at = :updated_at '
+        . 'WHERE variant_id = :variant_id AND bucket_at = :bucket_at AND status = :running_status';
+    $updateStmt = $pdo->prepare($updateSql);
+
+    $count = 0;
+    $i = 0;
+    while ($i < count($rows)) {
+        $row = $rows[$i];
+        $variantId = isset($row['variant_id']) ? (string)$row['variant_id'] : '';
+        $bucketAt = isset($row['bucket_at']) ? (string)$row['bucket_at'] : '';
+        $lockedAt = isset($row['locked_at']) ? (string)$row['locked_at'] : '';
+        if ($variantId !== '' && $bucketAt !== '') {
+            $reason = 'auto recovered stale running task';
+            if ($lockedAt !== '') {
+                $reason .= ' (locked_at=' . $lockedAt . ')';
+            }
+            $updateStmt->execute(array(
+                ':status' => 'queued_retry',
+                ':execute_after' => $now,
+                ':last_error' => $reason,
+                ':updated_at' => $now,
+                ':variant_id' => $variantId,
+                ':bucket_at' => $bucketAt,
+                ':running_status' => 'running',
+            ));
+            if ($updateStmt->rowCount() > 0) {
+                $count++;
+            }
+        }
+        $i++;
+    }
+    return $count;
+}
+
 function qrs_worker_new_run_id()
 {
     $rand = '';
@@ -714,6 +776,7 @@ $workerMaxJobsPerRun = 20;
 $workerPollTimeoutSeconds = 300;
 $workerPollIntervalMillis = 1000;
 $workerNoDueBackoffMillis = 1000;
+$workerRunningStaleSeconds = 900;
 try {
     $storeRawPayload = (qrs_worker_get_meta($pdo, 'runtime.store_raw_redash_payload', '0') === '1');
     $rawPayloadDir = qrs_worker_resolve_store_dir($rootDir, qrs_worker_get_meta($pdo, 'runtime.raw_redash_payload_dir', 'var/redash_raw'));
@@ -722,10 +785,21 @@ try {
     $workerMaxJobsPerRun = qrs_worker_get_meta_int($pdo, 'worker.max_jobs_per_run', 20, 1, 10000);
     $workerPollTimeoutSeconds = qrs_worker_get_meta_int($pdo, 'worker.poll_timeout_seconds', 300, 1, 86400);
     $workerPollIntervalMillis = qrs_worker_get_meta_int($pdo, 'worker.poll_interval_millis', 1000, 100, 60000);
+    $workerRunningStaleSeconds = qrs_worker_get_meta_int($pdo, 'worker.running_stale_seconds', 900, 1, 86400);
 } catch (Exception $e) {
     fwrite(STDERR, '[qrs-worker] failed to load runtime meta settings: ' . $e->getMessage() . "\n");
 }
 $hadActivity = false;
+
+try {
+    $recoveredCount = qrs_worker_recover_stale_running($pdo, $workerRunningStaleSeconds);
+    if ($recoveredCount > 0) {
+        $hadActivity = true;
+        fwrite(STDOUT, '[qrs-worker] recovered stale running buckets=' . $recoveredCount . "\n");
+    }
+} catch (Exception $e) {
+    fwrite(STDERR, '[qrs-worker] stale recovery failed: ' . $e->getMessage() . "\n");
+}
 
 // Phase 1: dispatch-equivalent tasks.
 if (!$isChildMode) {

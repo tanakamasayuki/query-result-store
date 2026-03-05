@@ -2,6 +2,24 @@
 
 class QrsDispatchPlanner
 {
+    private static function queuePriority($queueStatus)
+    {
+        $s = trim((string)$queueStatus);
+        if ($s === 'queued_scheduled') {
+            return 400;
+        }
+        if ($s === 'queued_retry') {
+            return 300;
+        }
+        if ($s === 'queued_manual') {
+            return 200;
+        }
+        if ($s === 'queued_backfill') {
+            return 100;
+        }
+        return 0;
+    }
+
     public static function resolveParameterValues($parameterJson, $nowTs, $bucketAtText)
     {
         $parameterMap = self::decodeJsonObject($parameterJson);
@@ -48,7 +66,7 @@ class QrsDispatchPlanner
             $preview['next_runs'][] = array(
                 'execute_at' => date('Y-m-d H:i:s', $nowTs),
                 'bucket_at' => '',
-                'priority' => 1,
+                'priority' => self::queuePriority('queued_manual'),
                 'parameter_values' => self::buildParameterPreviewRows($parameterMap, $nowTs, null),
             );
             $preview['parameter_preview'] = self::buildParameterPreviewRows($parameterMap, $nowTs, null);
@@ -72,7 +90,7 @@ class QrsDispatchPlanner
             $preview['next_runs'] = self::buildNextRunsForLatest($interval, $nowTs, $maxFuture);
             $idx = 0;
             while ($idx < count($preview['next_runs'])) {
-                $preview['next_runs'][$idx]['priority'] = ($maxFuture - $idx);
+                $preview['next_runs'][$idx]['priority'] = self::queuePriority('queued_scheduled');
                 $preview['next_runs'][$idx]['parameter_values'] = self::buildParameterPreviewRows($parameterMap, $nowTs, null);
                 $idx++;
             }
@@ -112,7 +130,7 @@ class QrsDispatchPlanner
             $targets[] = array(
                 'bucket_at' => date('Y-m-d H:i:s', $bucketTs),
                 'execute_after' => date('Y-m-d H:i:s', $bucketTs + $lagSec),
-                'priority' => ($lookbackCount - $i),
+                'priority' => ($i === 0) ? self::queuePriority('queued_scheduled') : self::queuePriority('queued_backfill'),
                 'parameter_values' => self::buildParameterPreviewRows($parameterMap, $nowTs, $bucketTs),
             );
             $i++;
@@ -126,7 +144,7 @@ class QrsDispatchPlanner
             $future[] = array(
                 'execute_at' => date('Y-m-d H:i:s', $bucketTs + $lagSec),
                 'bucket_at' => date('Y-m-d H:i:s', $bucketTs),
-                'priority' => ($maxFuture - $j),
+                'priority' => self::queuePriority('queued_scheduled'),
                 'parameter_values' => self::buildParameterPreviewRows($parameterMap, $nowTs, $bucketTs),
             );
             $j++;
@@ -203,8 +221,10 @@ class QrsDispatchPlanner
                 'variant_id' => $variantId,
                 'bucket_at' => date('Y-m-d H:i:s', $bucketTs),
                 'execute_after' => date('Y-m-d H:i:s', $bucketTs + $lagSec),
-                'priority' => ($lookbackCount - $i),
                 'queue_status' => ($i === 0) ? 'queued_scheduled' : 'queued_backfill',
+                'priority' => ($i === 0)
+                    ? self::queuePriority('queued_scheduled')
+                    : self::queuePriority('queued_backfill'),
             );
             $i++;
         }
