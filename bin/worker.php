@@ -312,12 +312,43 @@ function qrs_worker_find_due_buckets($pdo, $limit)
     return $stmt->fetchAll();
 }
 
+function qrs_worker_find_due_buckets_claimable($pdo, $limit)
+{
+    $n = (int)$limit;
+    if ($n <= 0) {
+        $n = 20;
+    }
+    $now = date('Y-m-d H:i:s');
+    $sql = 'SELECT b.variant_id, b.bucket_at, b.status, b.priority, b.execute_after, b.attempt_count, v.dataset_id '
+        . 'FROM qrs_sys_buckets b '
+        . 'INNER JOIN qrs_sys_variants v ON v.variant_id = b.variant_id '
+        . 'WHERE b.status IN (\'queued_scheduled\', \'queued_retry\', \'queued_manual\', \'queued_backfill\') '
+        . 'AND b.execute_after <= :now '
+        . 'AND NOT EXISTS ('
+        . '  SELECT 1 FROM qrs_sys_buckets rb '
+        . '  INNER JOIN qrs_sys_variants rv ON rv.variant_id = rb.variant_id '
+        . '  WHERE rb.status = \'running\' AND rv.dataset_id = v.dataset_id'
+        . ') '
+        . 'ORDER BY b.priority DESC, b.execute_after ASC, b.bucket_at ASC '
+        . 'LIMIT ' . $n;
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute(array(':now' => $now));
+    return $stmt->fetchAll();
+}
+
 function qrs_worker_mark_running($pdo, $variantId, $bucketAt, $workerId)
 {
     $now = date('Y-m-d H:i:s');
     $sql = 'UPDATE qrs_sys_buckets SET status = :next_status, locked_by = :locked_by, locked_at = :locked_at, started_at = :started_at, '
         . 'attempt_count = attempt_count + 1, updated_at = :updated_at '
         . 'WHERE variant_id = :variant_id AND bucket_at = :bucket_at '
+        . 'AND execute_after <= :now '
+        . 'AND NOT EXISTS ('
+        . '  SELECT 1 FROM qrs_sys_buckets rb '
+        . '  INNER JOIN qrs_sys_variants rv ON rv.variant_id = rb.variant_id '
+        . '  WHERE rb.status = \'running\' '
+        . '    AND rv.dataset_id = (SELECT dataset_id FROM qrs_sys_variants WHERE variant_id = :variant_id_for_dataset)'
+        . ') '
         . 'AND status IN (\'queued_scheduled\', \'queued_retry\', \'queued_manual\', \'queued_backfill\')';
     $stmt = $pdo->prepare($sql);
     $stmt->execute(array(
@@ -328,8 +359,28 @@ function qrs_worker_mark_running($pdo, $variantId, $bucketAt, $workerId)
         ':updated_at' => $now,
         ':variant_id' => $variantId,
         ':bucket_at' => $bucketAt,
+        ':now' => $now,
+        ':variant_id_for_dataset' => $variantId,
     ));
     return ($stmt->rowCount() > 0);
+}
+
+function qrs_worker_claim_one_due_bucket($pdo, $workerId, $limit)
+{
+    $candidates = qrs_worker_find_due_buckets_claimable($pdo, $limit);
+    $i = 0;
+    while ($i < count($candidates)) {
+        $c = $candidates[$i];
+        $variantId = isset($c['variant_id']) ? (string)$c['variant_id'] : '';
+        $bucketAt = isset($c['bucket_at']) ? (string)$c['bucket_at'] : '';
+        if ($variantId !== '' && $bucketAt !== '') {
+            if (qrs_worker_mark_running($pdo, $variantId, $bucketAt, $workerId)) {
+                return $c;
+            }
+        }
+        $i++;
+    }
+    return null;
 }
 
 function qrs_worker_mark_success($pdo, $variantId, $bucketAt, $rowCount, $fetchSeconds)
@@ -392,6 +443,21 @@ function qrs_worker_get_meta($pdo, $key, $defaultValue)
         return $defaultValue;
     }
     return (string)$row['meta_value'];
+}
+
+function qrs_worker_get_meta_int($pdo, $key, $defaultValue, $minValue, $maxValue)
+{
+    $raw = qrs_worker_get_meta($pdo, $key, (string)$defaultValue);
+    $v = (int)$raw;
+    $min = (int)$minValue;
+    $max = (int)$maxValue;
+    if ($v < $min) {
+        $v = $min;
+    }
+    if ($max > 0 && $v > $max) {
+        $v = $max;
+    }
+    return $v;
 }
 
 function qrs_worker_resolve_store_dir($rootDir, $dirSetting)
@@ -476,7 +542,126 @@ function qrs_worker_enqueue_bucket($pdo, $target)
     return array('inserted' => true, 'reason' => 'created');
 }
 
+function qrs_worker_execute_claimed_bucket($pdo, $variantRepo, $datasetRepo, $instanceRepo, $client, $variantId, $bucketAt, $storeRawPayload, $rawPayloadDir, $pollTimeoutSeconds, $pollIntervalMillis)
+{
+    qrs_worker_log_event($pdo, $variantId, $bucketAt, 'info', 'bucket execution started', 'running', null, null, array());
+    try {
+        $variant = $variantRepo->findById($variantId);
+        if ($variant === null) {
+            throw new Exception('Variant not found.');
+        }
+        $dataset = $datasetRepo->findById($variant['dataset_id']);
+        if ($dataset === null) {
+            throw new Exception('Dataset not found.');
+        }
+        $instance = $instanceRepo->findById($dataset['instance_id']);
+        if ($instance === null || (int)$instance['is_enabled'] !== 1) {
+            throw new Exception('Instance not found or disabled.');
+        }
+
+        $nowTs = time();
+        $params = QrsDispatchPlanner::resolveParameterValues($variant['parameter_json'], $nowTs, $bucketAt);
+
+        $fetchStarted = microtime(true);
+        $exec = $client->executeQuery(
+            $instance['base_url'],
+            $instance['api_key'],
+            $dataset['query_id'],
+            $params,
+            $pollTimeoutSeconds,
+            $pollIntervalMillis
+        );
+        $fetchSeconds = microtime(true) - $fetchStarted;
+        if (!$exec['ok']) {
+            throw new Exception($exec['message'] . ' (HTTP ' . (string)$exec['status_code'] . ')');
+        }
+
+        list($columns, $rows) = qrs_worker_extract_columns_rows($exec['query_result']);
+        $detectedTypeMap = qrs_worker_extract_column_type_map($exec['query_result']);
+        if (count($columns) === 0 && count($rows) > 0) {
+            throw new Exception('No columns in query result.');
+        }
+
+        $tableName = qrs_worker_storage_table_name($dataset['dataset_id'], $variantId);
+        $overrideMap = qrs_worker_decode_column_overrides(
+            isset($variant['column_type_overrides_json']) ? $variant['column_type_overrides_json'] : '{}'
+        );
+        $tableName = qrs_worker_ensure_schema_and_table($pdo, $variantId, $tableName, $columns, $overrideMap, $detectedTypeMap);
+
+        $runId = qrs_worker_new_run_id();
+        $rawSavedPath = '';
+        if ($storeRawPayload && isset($exec['raw_json'])) {
+            $rawSavedPath = qrs_worker_write_raw_payload(
+                $rawPayloadDir,
+                $runId,
+                $variantId,
+                $bucketAt,
+                isset($exec['raw_source']) ? (string)$exec['raw_source'] : 'raw',
+                (string)$exec['raw_json']
+            );
+        }
+        $pdo->beginTransaction();
+        try {
+            $rowCount = qrs_worker_save_rows($pdo, $tableName, $variant['mode'], $bucketAt, $runId, $rows, $columns);
+            qrs_worker_mark_success($pdo, $variantId, $bucketAt, $rowCount, $fetchSeconds);
+            $pdo->commit();
+        } catch (Exception $saveEx) {
+            $pdo->rollBack();
+            throw $saveEx;
+        }
+
+        qrs_worker_log_event(
+            $pdo,
+            $variantId,
+            $bucketAt,
+            'info',
+            'bucket execution succeeded',
+            'success',
+            $rowCount,
+            $fetchSeconds,
+            array(
+                'storage_table' => $tableName,
+                'raw_payload_path' => $rawSavedPath
+            )
+        );
+        fwrite(STDOUT, '[qrs-worker] executed variant=' . $variantId . ' bucket_at=' . $bucketAt . ' rows=' . $rowCount . "\n");
+        return true;
+    } catch (Exception $e) {
+        qrs_worker_mark_failed($pdo, $variantId, $bucketAt, $e->getMessage());
+        qrs_worker_log_event($pdo, $variantId, $bucketAt, 'error', 'bucket execution failed: ' . $e->getMessage(), 'failed', null, null, array());
+        fwrite(STDERR, '[qrs-worker] execute failed variant=' . $variantId . ' bucket_at=' . $bucketAt . ' error=' . $e->getMessage() . "\n");
+        return false;
+    }
+}
+
+function qrs_worker_spawn_child($scriptPath)
+{
+    if (!function_exists('proc_open')) {
+        return false;
+    }
+    $phpBin = defined('PHP_BINARY') ? PHP_BINARY : 'php';
+    $cmd = escapeshellarg($phpBin) . ' ' . escapeshellarg($scriptPath) . ' --child';
+    $descriptors = array(
+        0 => array('pipe', 'r'),
+        1 => array('pipe', 'w'),
+        2 => array('pipe', 'w'),
+    );
+    $proc = @proc_open($cmd, $descriptors, $pipes);
+    if (!is_resource($proc)) {
+        return false;
+    }
+    if (isset($pipes[0]) && is_resource($pipes[0])) {
+        fclose($pipes[0]);
+    }
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+    return array('proc' => $proc, 'pipes' => $pipes, 'stdout' => '', 'stderr' => '');
+}
+
 $rootDir = dirname(__DIR__);
+$scriptPath = __FILE__;
+$argvList = isset($_SERVER['argv']) && is_array($_SERVER['argv']) ? $_SERVER['argv'] : array();
+$isChildMode = in_array('--child', $argvList, true);
 $config = QrsConfig::load($rootDir);
 QrsConfig::applyTimezone($config);
 $dbConfigExplicit = QrsConfig::hasExplicitDbConfig($rootDir);
@@ -506,75 +691,95 @@ $startedAt = date('Y-m-d H:i:s');
 fwrite(STDOUT, '[qrs-worker] started at ' . $startedAt . "\n");
 $storeRawPayload = false;
 $rawPayloadDir = qrs_worker_resolve_store_dir($rootDir, 'var/redash_raw');
+$workerGlobalConcurrency = 1;
+$workerMaxRunSeconds = 150;
+$workerMaxJobsPerRun = 20;
+$workerPollTimeoutSeconds = 300;
+$workerPollIntervalMillis = 1000;
 try {
     $storeRawPayload = (qrs_worker_get_meta($pdo, 'runtime.store_raw_redash_payload', '0') === '1');
     $rawPayloadDir = qrs_worker_resolve_store_dir($rootDir, qrs_worker_get_meta($pdo, 'runtime.raw_redash_payload_dir', 'var/redash_raw'));
+    $workerGlobalConcurrency = qrs_worker_get_meta_int($pdo, 'worker.global_concurrency', 1, 1, 16);
+    $workerMaxRunSeconds = qrs_worker_get_meta_int($pdo, 'worker.max_run_seconds', 150, 1, 86400);
+    $workerMaxJobsPerRun = qrs_worker_get_meta_int($pdo, 'worker.max_jobs_per_run', 20, 1, 10000);
+    $workerPollTimeoutSeconds = qrs_worker_get_meta_int($pdo, 'worker.poll_timeout_seconds', 300, 1, 86400);
+    $workerPollIntervalMillis = qrs_worker_get_meta_int($pdo, 'worker.poll_interval_millis', 1000, 100, 60000);
 } catch (Exception $e) {
     fwrite(STDERR, '[qrs-worker] failed to load runtime meta settings: ' . $e->getMessage() . "\n");
 }
+fwrite(
+    STDOUT,
+    '[qrs-worker] runtime settings: global_concurrency=' . $workerGlobalConcurrency
+    . ' max_run_seconds=' . $workerMaxRunSeconds
+    . ' max_jobs_per_run=' . $workerMaxJobsPerRun
+    . ' poll_timeout_seconds=' . $workerPollTimeoutSeconds
+    . ' poll_interval_millis=' . $workerPollIntervalMillis . "\n"
+);
 
 // Phase 1: dispatch-equivalent tasks.
-try {
-    $variantRepo = new QrsVariantRepository($pdo);
-    $allVariants = $variantRepo->findAllWithDataset('');
-    $nowTs = time();
-    $dispatchCount = 0;
+if (!$isChildMode) {
+    try {
+        $variantRepo = new QrsVariantRepository($pdo);
+        $allVariants = $variantRepo->findAllWithDataset('');
+        $nowTs = time();
+        $dispatchCount = 0;
 
-    foreach ($allVariants as $variant) {
-        if ((int)$variant['is_enabled'] !== 1) {
-            continue;
-        }
-
-        $targets = QrsDispatchPlanner::buildDispatchTargets(
-            $variant['variant_id'],
-            $variant['mode'],
-            $variant['schedule_json'],
-            $nowTs,
-            50
-        );
-
-        $i = 0;
-        while ($i < count($targets)) {
-            $t = $targets[$i];
-            $enqueue = qrs_worker_enqueue_bucket($pdo, $t);
-            if ($enqueue['inserted']) {
-                qrs_worker_log_event(
-                    $pdo,
-                    $t['variant_id'],
-                    $t['bucket_at'],
-                    'info',
-                    'bucket dispatched',
-                    isset($t['queue_status']) ? $t['queue_status'] : 'queued_scheduled',
-                    null,
-                    null,
-                    array(
-                        'priority' => isset($t['priority']) ? (int)$t['priority'] : 0,
-                        'execute_after' => isset($t['execute_after']) ? (string)$t['execute_after'] : null,
-                    )
-                );
-                fwrite(
-                    STDOUT,
-                    '[qrs-worker] dispatched variant=' . $t['variant_id']
-                    . ' bucket_at=' . $t['bucket_at']
-                    . ' priority=' . (isset($t['priority']) ? $t['priority'] : 0) . "\n"
-                );
-                $dispatchCount++;
-            } else {
-                fwrite(
-                    STDOUT,
-                    '[qrs-worker] skip dispatch variant=' . $t['variant_id']
-                    . ' bucket_at=' . $t['bucket_at']
-                    . ' reason=' . $enqueue['reason'] . "\n"
-                );
+        foreach ($allVariants as $variant) {
+            if ((int)$variant['is_enabled'] !== 1) {
+                continue;
             }
-            $i++;
-        }
-    }
 
-    fwrite(STDOUT, '[qrs-worker] dispatch inserted=' . $dispatchCount . "\n");
-} catch (Exception $e) {
-    fwrite(STDERR, '[qrs-worker] dispatch phase failed: ' . $e->getMessage() . "\n");
-    exit(1);
+            $targets = QrsDispatchPlanner::buildDispatchTargets(
+                $variant['variant_id'],
+                $variant['mode'],
+                $variant['schedule_json'],
+                $nowTs,
+                50
+            );
+
+            $i = 0;
+            while ($i < count($targets)) {
+                $t = $targets[$i];
+                $enqueue = qrs_worker_enqueue_bucket($pdo, $t);
+                if ($enqueue['inserted']) {
+                    qrs_worker_log_event(
+                        $pdo,
+                        $t['variant_id'],
+                        $t['bucket_at'],
+                        'info',
+                        'bucket dispatched',
+                        isset($t['queue_status']) ? $t['queue_status'] : 'queued_scheduled',
+                        null,
+                        null,
+                        array(
+                            'priority' => isset($t['priority']) ? (int)$t['priority'] : 0,
+                            'execute_after' => isset($t['execute_after']) ? (string)$t['execute_after'] : null,
+                        )
+                    );
+                    fwrite(
+                        STDOUT,
+                        '[qrs-worker] dispatched variant=' . $t['variant_id']
+                        . ' bucket_at=' . $t['bucket_at']
+                        . ' priority=' . (isset($t['priority']) ? $t['priority'] : 0) . "\n"
+                    );
+                    $dispatchCount++;
+                } else {
+                    fwrite(
+                        STDOUT,
+                        '[qrs-worker] skip dispatch variant=' . $t['variant_id']
+                        . ' bucket_at=' . $t['bucket_at']
+                        . ' reason=' . $enqueue['reason'] . "\n"
+                    );
+                }
+                $i++;
+            }
+        }
+
+        fwrite(STDOUT, '[qrs-worker] dispatch inserted=' . $dispatchCount . "\n");
+    } catch (Exception $e) {
+        fwrite(STDERR, '[qrs-worker] dispatch phase failed: ' . $e->getMessage() . "\n");
+        exit(1);
+    }
 }
 
 // Phase 2: execute-equivalent tasks.
@@ -584,109 +789,146 @@ try {
     $instanceRepo = new QrsInstanceRepository($pdo);
     $client = new QrsRedashClient();
     $workerId = gethostname() . ':' . getmypid();
-    $executeCount = 0;
-    $due = qrs_worker_find_due_buckets($pdo, 20);
+    $runStartedTs = time();
 
-    $i = 0;
-    while ($i < count($due)) {
-        $bucket = $due[$i];
-        $variantId = isset($bucket['variant_id']) ? (string)$bucket['variant_id'] : '';
-        $bucketAt = isset($bucket['bucket_at']) ? (string)$bucket['bucket_at'] : '';
+    if ($isChildMode) {
+        $claimed = qrs_worker_claim_one_due_bucket($pdo, $workerId, 20);
+        if ($claimed === null) {
+            fwrite(STDOUT, '[qrs-worker] child no due bucket' . "\n");
+            exit(2);
+        }
+        $variantId = isset($claimed['variant_id']) ? (string)$claimed['variant_id'] : '';
+        $bucketAt = isset($claimed['bucket_at']) ? (string)$claimed['bucket_at'] : '';
         if ($variantId === '' || $bucketAt === '') {
-            $i++;
-            continue;
+            fwrite(STDOUT, '[qrs-worker] child invalid claimed bucket' . "\n");
+            exit(2);
         }
-
-        if (!qrs_worker_mark_running($pdo, $variantId, $bucketAt, $workerId)) {
-            $i++;
-            continue;
-        }
-
-        qrs_worker_log_event($pdo, $variantId, $bucketAt, 'info', 'bucket execution started', 'running', null, null, array());
-        try {
-            $variant = $variantRepo->findById($variantId);
-            if ($variant === null) {
-                throw new Exception('Variant not found.');
-            }
-            $dataset = $datasetRepo->findById($variant['dataset_id']);
-            if ($dataset === null) {
-                throw new Exception('Dataset not found.');
-            }
-            $instance = $instanceRepo->findById($dataset['instance_id']);
-            if ($instance === null || (int)$instance['is_enabled'] !== 1) {
-                throw new Exception('Instance not found or disabled.');
-            }
-
-            $nowTs = time();
-            $params = QrsDispatchPlanner::resolveParameterValues($variant['parameter_json'], $nowTs, $bucketAt);
-
-            $fetchStarted = microtime(true);
-            $exec = $client->executeQuery($instance['base_url'], $instance['api_key'], $dataset['query_id'], $params, 60);
-            $fetchSeconds = microtime(true) - $fetchStarted;
-            if (!$exec['ok']) {
-                throw new Exception($exec['message'] . ' (HTTP ' . (string)$exec['status_code'] . ')');
-            }
-
-            list($columns, $rows) = qrs_worker_extract_columns_rows($exec['query_result']);
-            $detectedTypeMap = qrs_worker_extract_column_type_map($exec['query_result']);
-            if (count($columns) === 0 && count($rows) > 0) {
-                throw new Exception('No columns in query result.');
-            }
-
-            $tableName = qrs_worker_storage_table_name($dataset['dataset_id'], $variantId);
-            $overrideMap = qrs_worker_decode_column_overrides(
-                isset($variant['column_type_overrides_json']) ? $variant['column_type_overrides_json'] : '{}'
-            );
-            $tableName = qrs_worker_ensure_schema_and_table($pdo, $variantId, $tableName, $columns, $overrideMap, $detectedTypeMap);
-
-            $runId = qrs_worker_new_run_id();
-            $rawSavedPath = '';
-            if ($storeRawPayload && isset($exec['raw_json'])) {
-                $rawSavedPath = qrs_worker_write_raw_payload(
-                    $rawPayloadDir,
-                    $runId,
-                    $variantId,
-                    $bucketAt,
-                    isset($exec['raw_source']) ? (string)$exec['raw_source'] : 'raw',
-                    (string)$exec['raw_json']
-                );
-            }
-            $pdo->beginTransaction();
-            try {
-                $rowCount = qrs_worker_save_rows($pdo, $tableName, $variant['mode'], $bucketAt, $runId, $rows, $columns);
-                qrs_worker_mark_success($pdo, $variantId, $bucketAt, $rowCount, $fetchSeconds);
-                $pdo->commit();
-            } catch (Exception $saveEx) {
-                $pdo->rollBack();
-                throw $saveEx;
-            }
-
-            qrs_worker_log_event(
-                $pdo,
-                $variantId,
-                $bucketAt,
-                'info',
-                'bucket execution succeeded',
-                'success',
-                $rowCount,
-                $fetchSeconds,
-                array(
-                    'storage_table' => $tableName,
-                    'raw_payload_path' => $rawSavedPath
-                )
-            );
-            fwrite(STDOUT, '[qrs-worker] executed variant=' . $variantId . ' bucket_at=' . $bucketAt . ' rows=' . $rowCount . "\n");
-            $executeCount++;
-        } catch (Exception $e) {
-            qrs_worker_mark_failed($pdo, $variantId, $bucketAt, $e->getMessage());
-            qrs_worker_log_event($pdo, $variantId, $bucketAt, 'error', 'bucket execution failed: ' . $e->getMessage(), 'failed', null, null, array());
-            fwrite(STDERR, '[qrs-worker] execute failed variant=' . $variantId . ' bucket_at=' . $bucketAt . ' error=' . $e->getMessage() . "\n");
-        }
-
-        $i++;
+        qrs_worker_execute_claimed_bucket(
+            $pdo,
+            $variantRepo,
+            $datasetRepo,
+            $instanceRepo,
+            $client,
+            $variantId,
+            $bucketAt,
+            $storeRawPayload,
+            $rawPayloadDir,
+            $workerPollTimeoutSeconds,
+            $workerPollIntervalMillis
+        );
+        exit(0);
     }
 
-    fwrite(STDOUT, '[qrs-worker] execute completed=' . $executeCount . "\n");
+    if ($workerGlobalConcurrency <= 1 || !function_exists('proc_open')) {
+        $executeCount = 0;
+        while (true) {
+            if ($executeCount >= $workerMaxJobsPerRun) {
+                break;
+            }
+            if ((time() - $runStartedTs) >= $workerMaxRunSeconds) {
+                break;
+            }
+
+            $claimed = qrs_worker_claim_one_due_bucket($pdo, $workerId, 20);
+            if ($claimed === null) {
+                break;
+            }
+            $variantId = isset($claimed['variant_id']) ? (string)$claimed['variant_id'] : '';
+            $bucketAt = isset($claimed['bucket_at']) ? (string)$claimed['bucket_at'] : '';
+            if ($variantId === '' || $bucketAt === '') {
+                break;
+            }
+            qrs_worker_execute_claimed_bucket(
+                $pdo,
+                $variantRepo,
+                $datasetRepo,
+                $instanceRepo,
+                $client,
+                $variantId,
+                $bucketAt,
+                $storeRawPayload,
+                $rawPayloadDir,
+                $workerPollTimeoutSeconds,
+                $workerPollIntervalMillis
+            );
+            $executeCount++;
+        }
+        fwrite(STDOUT, '[qrs-worker] execute completed=' . $executeCount . "\n");
+    } else {
+        $launchedCount = 0;
+        $successCount = 0;
+        $children = array();
+        $spawnDisabled = false;
+        $noDueObserved = false;
+
+        while (true) {
+            // Reap finished children.
+            $nextChildren = array();
+            $i = 0;
+            while ($i < count($children)) {
+                $child = $children[$i];
+                $proc = $child['proc'];
+                $pipes = $child['pipes'];
+                if (isset($pipes[1]) && is_resource($pipes[1])) {
+                    $outChunk = stream_get_contents($pipes[1]);
+                    if (is_string($outChunk) && $outChunk !== '') {
+                        fwrite(STDOUT, $outChunk);
+                    }
+                }
+                if (isset($pipes[2]) && is_resource($pipes[2])) {
+                    $errChunk = stream_get_contents($pipes[2]);
+                    if (is_string($errChunk) && $errChunk !== '') {
+                        fwrite(STDERR, $errChunk);
+                    }
+                }
+                $status = proc_get_status($proc);
+                if ($status['running']) {
+                    $nextChildren[] = $child;
+                } else {
+                    if (isset($pipes[1]) && is_resource($pipes[1])) {
+                        fclose($pipes[1]);
+                    }
+                    if (isset($pipes[2]) && is_resource($pipes[2])) {
+                        fclose($pipes[2]);
+                    }
+                    $exitCode = proc_close($proc);
+                    if ($exitCode === 0) {
+                        $successCount++;
+                        $noDueObserved = false;
+                    } elseif ($exitCode === 2) {
+                        $noDueObserved = true;
+                    }
+                }
+                $i++;
+            }
+            $children = $nextChildren;
+
+            $deadlineReached = ((time() - $runStartedTs) >= $workerMaxRunSeconds);
+            $jobLimitReached = ($launchedCount >= $workerMaxJobsPerRun);
+            if (!$deadlineReached && !$jobLimitReached && !$spawnDisabled) {
+                while (count($children) < $workerGlobalConcurrency && $launchedCount < $workerMaxJobsPerRun && ((time() - $runStartedTs) < $workerMaxRunSeconds)) {
+                    $spawned = qrs_worker_spawn_child($scriptPath);
+                    if ($spawned === false) {
+                        $spawnDisabled = true;
+                        break;
+                    }
+                    $children[] = $spawned;
+                    $launchedCount++;
+                    $noDueObserved = false;
+                }
+            }
+
+            if (($deadlineReached || $jobLimitReached || $spawnDisabled) && count($children) === 0) {
+                break;
+            }
+            if (!$deadlineReached && !$jobLimitReached && count($children) === 0 && $noDueObserved) {
+                break;
+            }
+            usleep(200000);
+        }
+
+        fwrite(STDOUT, '[qrs-worker] execute completed=' . $successCount . ' launched=' . $launchedCount . "\n");
+    }
 } catch (Exception $e) {
     fwrite(STDERR, '[qrs-worker] execute phase failed: ' . $e->getMessage() . "\n");
     exit(1);

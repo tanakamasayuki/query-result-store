@@ -75,7 +75,7 @@ class QrsRedashClient
         return array('ok' => true, 'status_code' => $statusCode, 'message' => 'Query details fetched.', 'data' => $data);
     }
 
-    public function executeQuery($baseUrl, $apiKey, $queryId, $parameters, $maxWaitSeconds)
+    public function executeQuery($baseUrl, $apiKey, $queryId, $parameters, $maxWaitSeconds, $pollIntervalMillis = 500)
     {
         $queryId = trim((string)$queryId);
         if ($queryId === '' || !preg_match('/^[0-9]+$/', $queryId)) {
@@ -87,6 +87,10 @@ class QrsRedashClient
         $maxWait = (int)$maxWaitSeconds;
         if ($maxWait <= 0) {
             $maxWait = 30;
+        }
+        $pollInterval = (int)$pollIntervalMillis;
+        if ($pollInterval < 100) {
+            $pollInterval = 100;
         }
 
         $payload = array(
@@ -177,7 +181,7 @@ class QrsRedashClient
                 return array('ok' => false, 'status_code' => $jobResult['status_code'], 'message' => 'Execution job failed.');
             }
 
-            usleep(500000);
+            usleep($pollInterval * 1000);
         }
     }
 
