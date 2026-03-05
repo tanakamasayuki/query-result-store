@@ -154,6 +154,38 @@ class QrsDb
                 ));
             }
 
+            $defaultMetaValues = array(
+                'runtime.store_raw_redash_payload' => '0',
+                'runtime.raw_redash_payload_dir' => 'var/redash_raw',
+                'worker.global_concurrency' => '1',
+                'worker.max_run_seconds' => '150',
+                'worker.max_jobs_per_run' => '20',
+                'worker.poll_timeout_seconds' => '300',
+                'worker.poll_interval_millis' => '1000',
+            );
+            $upsertMetaStmt = $pdo->prepare(
+                'INSERT OR IGNORE INTO qrs_sys_meta (meta_key, meta_value, updated_at) VALUES (:meta_key, :meta_value, :updated_at)'
+            );
+            $driver = (string)$pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+            if ($driver === 'mysql') {
+                $upsertMetaStmt = $pdo->prepare(
+                    'INSERT IGNORE INTO qrs_sys_meta (meta_key, meta_value, updated_at) VALUES (:meta_key, :meta_value, :updated_at)'
+                );
+            } elseif ($driver === 'pgsql') {
+                $upsertMetaStmt = $pdo->prepare(
+                    'INSERT INTO qrs_sys_meta (meta_key, meta_value, updated_at) VALUES (:meta_key, :meta_value, :updated_at) '
+                    . 'ON CONFLICT (meta_key) DO NOTHING'
+                );
+            }
+            $now = date('Y-m-d H:i:s');
+            foreach ($defaultMetaValues as $metaKey => $metaValue) {
+                $upsertMetaStmt->execute(array(
+                    ':meta_key' => $metaKey,
+                    ':meta_value' => $metaValue,
+                    ':updated_at' => $now,
+                ));
+            }
+
             $pdo->commit();
         } catch (Exception $e) {
             $pdo->rollBack();

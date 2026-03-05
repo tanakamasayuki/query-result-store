@@ -124,8 +124,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $runtimeOk && $dbOk) {
                 if ($rawDir === '') {
                     $rawDir = 'var/redash_raw';
                 }
+                $workerGlobalConcurrency = isset($_POST['worker_global_concurrency']) ? (int)$_POST['worker_global_concurrency'] : 1;
+                if ($workerGlobalConcurrency < 1) {
+                    $workerGlobalConcurrency = 1;
+                }
+                $workerMaxRunSeconds = isset($_POST['worker_max_run_seconds']) ? (int)$_POST['worker_max_run_seconds'] : 150;
+                if ($workerMaxRunSeconds < 1) {
+                    $workerMaxRunSeconds = 1;
+                }
+                $workerMaxJobsPerRun = isset($_POST['worker_max_jobs_per_run']) ? (int)$_POST['worker_max_jobs_per_run'] : 20;
+                if ($workerMaxJobsPerRun < 1) {
+                    $workerMaxJobsPerRun = 1;
+                }
+                $workerPollTimeoutSeconds = isset($_POST['worker_poll_timeout_seconds']) ? (int)$_POST['worker_poll_timeout_seconds'] : 300;
+                if ($workerPollTimeoutSeconds < 1) {
+                    $workerPollTimeoutSeconds = 1;
+                }
+                $workerPollIntervalMillis = isset($_POST['worker_poll_interval_millis']) ? (int)$_POST['worker_poll_interval_millis'] : 1000;
+                if ($workerPollIntervalMillis < 100) {
+                    $workerPollIntervalMillis = 100;
+                }
                 $metaRepo->set('runtime.store_raw_redash_payload', $storeRaw);
                 $metaRepo->set('runtime.raw_redash_payload_dir', $rawDir);
+                $metaRepo->set('worker.global_concurrency', (string)$workerGlobalConcurrency);
+                $metaRepo->set('worker.max_run_seconds', (string)$workerMaxRunSeconds);
+                $metaRepo->set('worker.max_jobs_per_run', (string)$workerMaxJobsPerRun);
+                $metaRepo->set('worker.poll_timeout_seconds', (string)$workerPollTimeoutSeconds);
+                $metaRepo->set('worker.poll_interval_millis', (string)$workerPollIntervalMillis);
                 $message = t('runtime_settings_saved', array());
             } catch (Exception $e) {
                 $error = t('runtime_settings_save_error', array('message' => $e->getMessage()));
@@ -166,6 +191,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 $pdoDriverStatus = QrsRuntime::pdoDriverStatus();
 $runtimeStoreRaw = '0';
 $runtimeRawDir = 'var/redash_raw';
+$runtimeWorkerGlobalConcurrency = '1';
+$runtimeWorkerMaxRunSeconds = '150';
+$runtimeWorkerMaxJobsPerRun = '20';
+$runtimeWorkerPollTimeoutSeconds = '300';
+$runtimeWorkerPollIntervalMillis = '1000';
 if ($dbOk && $isInitialized) {
     try {
         $metaRepo = new QrsMetaRepository($pdo);
@@ -176,6 +206,26 @@ if ($dbOk && $isInitialized) {
         $runtimeRawDir = trim($metaRepo->get('runtime.raw_redash_payload_dir', 'var/redash_raw'));
         if ($runtimeRawDir === '') {
             $runtimeRawDir = 'var/redash_raw';
+        }
+        $runtimeWorkerGlobalConcurrency = trim($metaRepo->get('worker.global_concurrency', '1'));
+        if ($runtimeWorkerGlobalConcurrency === '') {
+            $runtimeWorkerGlobalConcurrency = '1';
+        }
+        $runtimeWorkerMaxRunSeconds = trim($metaRepo->get('worker.max_run_seconds', '150'));
+        if ($runtimeWorkerMaxRunSeconds === '') {
+            $runtimeWorkerMaxRunSeconds = '150';
+        }
+        $runtimeWorkerMaxJobsPerRun = trim($metaRepo->get('worker.max_jobs_per_run', '20'));
+        if ($runtimeWorkerMaxJobsPerRun === '') {
+            $runtimeWorkerMaxJobsPerRun = '20';
+        }
+        $runtimeWorkerPollTimeoutSeconds = trim($metaRepo->get('worker.poll_timeout_seconds', '300'));
+        if ($runtimeWorkerPollTimeoutSeconds === '') {
+            $runtimeWorkerPollTimeoutSeconds = '300';
+        }
+        $runtimeWorkerPollIntervalMillis = trim($metaRepo->get('worker.poll_interval_millis', '1000'));
+        if ($runtimeWorkerPollIntervalMillis === '') {
+            $runtimeWorkerPollIntervalMillis = '1000';
         }
     } catch (Exception $e) {
         $error = t('runtime_settings_load_error', array('message' => $e->getMessage()));
@@ -285,6 +335,21 @@ qrs_render_header('env', t('app_title', array()), $message, $error);
       <input type="text" name="raw_redash_payload_dir" value="<?php echo h($runtimeRawDir); ?>">
       <p class="muted"><?php echo h(t('runtime_setting_raw_dir_resolved', array('path' => $runtimeRawDirResolved))); ?></p>
       <p class="muted"><?php echo h(t('runtime_setting_raw_note', array())); ?></p>
+
+      <label><?php echo h(t('runtime_setting_worker_global_concurrency', array())); ?></label>
+      <input type="text" name="worker_global_concurrency" value="<?php echo h($runtimeWorkerGlobalConcurrency); ?>">
+
+      <label><?php echo h(t('runtime_setting_worker_max_run_seconds', array())); ?></label>
+      <input type="text" name="worker_max_run_seconds" value="<?php echo h($runtimeWorkerMaxRunSeconds); ?>">
+
+      <label><?php echo h(t('runtime_setting_worker_max_jobs_per_run', array())); ?></label>
+      <input type="text" name="worker_max_jobs_per_run" value="<?php echo h($runtimeWorkerMaxJobsPerRun); ?>">
+
+      <label><?php echo h(t('runtime_setting_worker_poll_timeout_seconds', array())); ?></label>
+      <input type="text" name="worker_poll_timeout_seconds" value="<?php echo h($runtimeWorkerPollTimeoutSeconds); ?>">
+
+      <label><?php echo h(t('runtime_setting_worker_poll_interval_millis', array())); ?></label>
+      <input type="text" name="worker_poll_interval_millis" value="<?php echo h($runtimeWorkerPollIntervalMillis); ?>">
 
       <div style="margin-top:10px;">
         <button type="submit"><?php echo h(t('runtime_settings_save_button', array())); ?></button>
