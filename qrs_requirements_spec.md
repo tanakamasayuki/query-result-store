@@ -180,6 +180,42 @@ Dispatcher runs periodically (example: every minute).
 
 Future implementations may support configurable concurrency.
 
+## 9.1 Worker Runtime Controls (Operational Settings)
+
+Worker behavior is controlled by operational settings stored in `qrs_sys_meta`.
+
+Primary settings:
+
+-   `worker.global_concurrency`
+    -   maximum concurrent executions (used when parallel execution is enabled)
+    -   recommended initial value: `1`
+-   `worker.max_run_seconds`
+    -   maximum seconds to keep claiming new jobs in a single worker run
+    -   recommended initial value: `150` (assuming every-minute cron + flock)
+-   `worker.max_jobs_per_run`
+    -   maximum number of jobs processed in a single worker run
+    -   recommended initial value: `20`
+-   `worker.poll_timeout_seconds`
+    -   timeout for waiting Redash job completion
+    -   recommended initial value: `300`
+-   `worker.poll_interval_millis`
+    -   polling interval for Redash job status (milliseconds)
+    -   recommended initial value: `1000`
+
+Termination behavior:
+
+-   after `max_run_seconds`, Worker **stops claiming new jobs**
+-   jobs already moved to `running` are completed before process exit
+
+Constraints for parallel execution:
+
+-   do not run the same `variant_id` concurrently (`per_variant_concurrency=1`)
+-   do not run the same `dataset_id` (same storage table) concurrently (`per_dataset_concurrency=1`)
+
+Note:
+
+-   `worker.dispatch_target_limit_per_variant` is not adopted for now (lookback target visibility is handled in Variant UI preview)
+
 ------------------------------------------------------------------------
 
 # 10. Execution Priority

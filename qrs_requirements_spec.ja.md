@@ -175,6 +175,42 @@ GUI 操作はジョブを直接実行しません。
 
 将来的には並行数の設定可能化をサポートする場合があります。
 
+## 9.1 Worker 実行制御（運用設定）
+
+Worker は `qrs_sys_meta` の運用設定を参照して挙動を制御する。
+
+主要設定:
+
+-   `worker.global_concurrency`
+    -   同時実行数（将来の並列実行時に使用）
+    -   推奨初期値: `1`
+-   `worker.max_run_seconds`
+    -   1回の Worker 起動で新規ジョブを取得し続ける上限秒数
+    -   推奨初期値: `150`（毎分 cron + flock 運用を想定）
+-   `worker.max_jobs_per_run`
+    -   1回の Worker 起動で処理する最大件数
+    -   推奨初期値: `20`
+-   `worker.poll_timeout_seconds`
+    -   Redash ジョブ完了待ちのタイムアウト秒数
+    -   推奨初期値: `300`
+-   `worker.poll_interval_millis`
+    -   Redash ジョブ状態ポーリング間隔（ミリ秒）
+    -   推奨初期値: `1000`
+
+終了条件:
+
+-   `max_run_seconds` 到達後は**新規ジョブを取得しない**
+-   すでに `running` に遷移済みのジョブは完了まで待機してから終了する
+
+並列実行時の制約:
+
+-   同一 `variant_id` は同時実行しない（`per_variant_concurrency=1`）
+-   同一 `dataset_id`（同一保存先テーブル）は同時実行しない（`per_dataset_concurrency=1`）
+
+注記:
+
+-   `worker.dispatch_target_limit_per_variant` は現時点では採用しない（実行定義UIで lookback 対象を確認できるため）
+
 ------------------------------------------------------------------------
 
 # 10. 実行優先度
