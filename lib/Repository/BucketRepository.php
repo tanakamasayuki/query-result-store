@@ -98,4 +98,67 @@ class QrsBucketRepository
         ));
         return ($stmt->rowCount() > 0);
     }
+
+    public function deleteBucketAndDataByKey($variantId, $bucketAt)
+    {
+        $variantId = trim((string)$variantId);
+        $bucketAt = trim((string)$bucketAt);
+        if ($variantId === '' || $bucketAt === '') {
+            return array('deleted_bucket' => false, 'deleted_rows' => 0);
+        }
+
+        $this->pdo->beginTransaction();
+        try {
+            $deletedRows = 0;
+
+            $metaSql = 'SELECT v.mode, s.storage_table '
+                . 'FROM qrs_sys_variants v '
+                . 'LEFT JOIN qrs_sys_schema s ON s.variant_id = v.variant_id '
+                . 'WHERE v.variant_id = :variant_id';
+            $metaStmt = $this->pdo->prepare($metaSql);
+            $metaStmt->execute(array(':variant_id' => $variantId));
+            $meta = $metaStmt->fetch();
+
+            if ($meta && isset($meta['storage_table']) && trim((string)$meta['storage_table']) !== '') {
+                $tableName = trim((string)$meta['storage_table']);
+                $tableSql = $this->quoteIdentifier($tableName);
+                $bucketCol = $this->quoteIdentifier('qrs_bucket_at');
+
+                // Delete only rows for the selected bucket.
+                $deleteDataSql = 'DELETE FROM ' . $tableSql . ' WHERE ' . $bucketCol . ' = :bucket_at';
+                $deleteDataStmt = $this->pdo->prepare($deleteDataSql);
+                $deleteDataStmt->execute(array(':bucket_at' => $bucketAt));
+                $deletedRows = (int)$deleteDataStmt->rowCount();
+            }
+
+            $deleteBucketSql = 'DELETE FROM qrs_sys_buckets WHERE variant_id = :variant_id AND bucket_at = :bucket_at';
+            $deleteBucketStmt = $this->pdo->prepare($deleteBucketSql);
+            $deleteBucketStmt->execute(array(
+                ':variant_id' => $variantId,
+                ':bucket_at' => $bucketAt,
+            ));
+            $deletedBucket = ($deleteBucketStmt->rowCount() > 0);
+
+            $this->pdo->commit();
+            return array('deleted_bucket' => $deletedBucket, 'deleted_rows' => $deletedRows);
+        } catch (Exception $e) {
+            $this->pdo->rollBack();
+            throw $e;
+        }
+    }
+
+    private function quoteIdentifier($name)
+    {
+        $driver = '';
+        try {
+            $driver = (string)$this->pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+        } catch (Exception $e) {
+            $driver = '';
+        }
+
+        if ($driver === 'mysql') {
+            return '`' . str_replace('`', '``', (string)$name) . '`';
+        }
+        return '"' . str_replace('"', '""', (string)$name) . '"';
+    }
 }

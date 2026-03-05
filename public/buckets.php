@@ -80,8 +80,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $runtimeOk && $dbOk) {
             }
         } elseif ($action === 'delete_bucket') {
             try {
-                if ($bucketRepo->deleteByKey($variantId, $bucketAt)) {
-                    $message = t('bucket_delete_ok', array('variant_id' => $variantId, 'bucket_at' => $bucketAt));
+                $deleteResult = $bucketRepo->deleteBucketAndDataByKey($variantId, $bucketAt);
+                if (isset($deleteResult['deleted_bucket']) && $deleteResult['deleted_bucket']) {
+                    $deletedRows = isset($deleteResult['deleted_rows']) ? (int)$deleteResult['deleted_rows'] : 0;
+                    $message = t('bucket_delete_ok_with_rows', array(
+                        'variant_id' => $variantId,
+                        'bucket_at' => $bucketAt,
+                        'rows' => $deletedRows,
+                    ));
                 } else {
                     $error = t('bucket_not_found', array());
                 }

@@ -269,6 +269,7 @@ return array(
     'bucket_delete_button' => '削除',
     'bucket_delete_confirm' => 'この Bucket を削除しますか？',
     'bucket_delete_ok' => 'Bucket を削除しました: {variant_id} / {bucket_at}',
+    'bucket_delete_ok_with_rows' => 'Bucket を削除しました: {variant_id} / {bucket_at}（データ {rows} 行も削除）',
     'bucket_delete_error' => 'Bucket の削除に失敗しました: {message}',
     'bucket_open_logs' => 'ログを見る',
     'bucket_list_error' => 'Bucket 一覧の取得に失敗しました: {message}',

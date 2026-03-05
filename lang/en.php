@@ -269,6 +269,7 @@ return array(
     'bucket_delete_button' => 'Delete',
     'bucket_delete_confirm' => 'Delete this bucket?',
     'bucket_delete_ok' => 'Bucket deleted: {variant_id} / {bucket_at}',
+    'bucket_delete_ok_with_rows' => 'Bucket deleted: {variant_id} / {bucket_at} (deleted {rows} data rows)',
     'bucket_delete_error' => 'Failed to delete bucket: {message}',
     'bucket_open_logs' => 'View logs',
     'bucket_list_error' => 'Failed to load buckets: {message}',

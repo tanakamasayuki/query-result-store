@@ -18,6 +18,14 @@ function qrs_worker_log_event($pdo, $variantId, $bucketAt, $level, $message, $st
         }
     }
 
+    $fetchSecondsValue = $fetchSeconds;
+    if ($fetchSecondsValue !== null && is_numeric($fetchSecondsValue)) {
+        $fetchSecondsValue = (float)$fetchSecondsValue;
+        if ($fetchSecondsValue < 0) {
+            $fetchSecondsValue = 0.0;
+        }
+    }
+
     $sql = 'INSERT INTO qrs_sys_logs (log_id, variant_id, bucket_at, status, row_count, fetch_seconds, level, message, context_json, created_at) '
         . 'VALUES (:log_id, :variant_id, :bucket_at, :status, :row_count, :fetch_seconds, :level, :message, :context_json, :created_at)';
     $stmt = $pdo->prepare($sql);
@@ -27,7 +35,7 @@ function qrs_worker_log_event($pdo, $variantId, $bucketAt, $level, $message, $st
         ':bucket_at' => $bucketAt,
         ':status' => $status,
         ':row_count' => $rowCount,
-        ':fetch_seconds' => $fetchSeconds,
+        ':fetch_seconds' => $fetchSecondsValue,
         ':level' => $level,
         ':message' => $message,
         ':context_json' => $ctx,
@@ -385,6 +393,16 @@ function qrs_worker_claim_one_due_bucket($pdo, $workerId, $limit)
 
 function qrs_worker_mark_success($pdo, $variantId, $bucketAt, $rowCount, $fetchSeconds)
 {
+    $fetchSecondsValue = $fetchSeconds;
+    if (is_numeric($fetchSecondsValue)) {
+        $fetchSecondsValue = (float)$fetchSecondsValue;
+        if ($fetchSecondsValue < 0) {
+            $fetchSecondsValue = 0.0;
+        }
+    } else {
+        $fetchSecondsValue = 0.0;
+    }
+
     $now = date('Y-m-d H:i:s');
     $sql = 'UPDATE qrs_sys_buckets SET status = :status, last_error = NULL, finished_at = :finished_at, '
         . 'last_row_count = :last_row_count, last_fetch_seconds = :last_fetch_seconds, updated_at = :updated_at '
@@ -394,7 +412,7 @@ function qrs_worker_mark_success($pdo, $variantId, $bucketAt, $rowCount, $fetchS
         ':status' => 'success',
         ':finished_at' => $now,
         ':last_row_count' => $rowCount,
-        ':last_fetch_seconds' => $fetchSeconds,
+        ':last_fetch_seconds' => $fetchSecondsValue,
         ':updated_at' => $now,
         ':variant_id' => $variantId,
         ':bucket_at' => $bucketAt,
@@ -688,7 +706,6 @@ if (!QrsDb::isInitialized($pdo)) {
 }
 
 $startedAt = date('Y-m-d H:i:s');
-fwrite(STDOUT, '[qrs-worker] started at ' . $startedAt . "\n");
 $storeRawPayload = false;
 $rawPayloadDir = qrs_worker_resolve_store_dir($rootDir, 'var/redash_raw');
 $workerGlobalConcurrency = 1;
@@ -696,6 +713,7 @@ $workerMaxRunSeconds = 150;
 $workerMaxJobsPerRun = 20;
 $workerPollTimeoutSeconds = 300;
 $workerPollIntervalMillis = 1000;
+$workerNoDueBackoffMillis = 1000;
 try {
     $storeRawPayload = (qrs_worker_get_meta($pdo, 'runtime.store_raw_redash_payload', '0') === '1');
     $rawPayloadDir = qrs_worker_resolve_store_dir($rootDir, qrs_worker_get_meta($pdo, 'runtime.raw_redash_payload_dir', 'var/redash_raw'));
@@ -707,14 +725,7 @@ try {
 } catch (Exception $e) {
     fwrite(STDERR, '[qrs-worker] failed to load runtime meta settings: ' . $e->getMessage() . "\n");
 }
-fwrite(
-    STDOUT,
-    '[qrs-worker] runtime settings: global_concurrency=' . $workerGlobalConcurrency
-    . ' max_run_seconds=' . $workerMaxRunSeconds
-    . ' max_jobs_per_run=' . $workerMaxJobsPerRun
-    . ' poll_timeout_seconds=' . $workerPollTimeoutSeconds
-    . ' poll_interval_millis=' . $workerPollIntervalMillis . "\n"
-);
+$hadActivity = false;
 
 // Phase 1: dispatch-equivalent tasks.
 if (!$isChildMode) {
@@ -763,19 +774,15 @@ if (!$isChildMode) {
                         . ' priority=' . (isset($t['priority']) ? $t['priority'] : 0) . "\n"
                     );
                     $dispatchCount++;
-                } else {
-                    fwrite(
-                        STDOUT,
-                        '[qrs-worker] skip dispatch variant=' . $t['variant_id']
-                        . ' bucket_at=' . $t['bucket_at']
-                        . ' reason=' . $enqueue['reason'] . "\n"
-                    );
                 }
                 $i++;
             }
         }
 
-        fwrite(STDOUT, '[qrs-worker] dispatch inserted=' . $dispatchCount . "\n");
+        if ($dispatchCount > 0) {
+            $hadActivity = true;
+            fwrite(STDOUT, '[qrs-worker] dispatch inserted=' . $dispatchCount . "\n");
+        }
     } catch (Exception $e) {
         fwrite(STDERR, '[qrs-worker] dispatch phase failed: ' . $e->getMessage() . "\n");
         exit(1);
@@ -794,13 +801,11 @@ try {
     if ($isChildMode) {
         $claimed = qrs_worker_claim_one_due_bucket($pdo, $workerId, 20);
         if ($claimed === null) {
-            fwrite(STDOUT, '[qrs-worker] child no due bucket' . "\n");
             exit(2);
         }
         $variantId = isset($claimed['variant_id']) ? (string)$claimed['variant_id'] : '';
         $bucketAt = isset($claimed['bucket_at']) ? (string)$claimed['bucket_at'] : '';
         if ($variantId === '' || $bucketAt === '') {
-            fwrite(STDOUT, '[qrs-worker] child invalid claimed bucket' . "\n");
             exit(2);
         }
         qrs_worker_execute_claimed_bucket(
@@ -853,13 +858,18 @@ try {
             );
             $executeCount++;
         }
-        fwrite(STDOUT, '[qrs-worker] execute completed=' . $executeCount . "\n");
+        if ($executeCount > 0) {
+            $hadActivity = true;
+            fwrite(STDOUT, '[qrs-worker] execute completed=' . $executeCount . "\n");
+        }
     } else {
-        $launchedCount = 0;
-        $successCount = 0;
+        $spawnedCount = 0;
+        $claimedCount = 0;
+        $claimedOrReservedCount = 0;
         $children = array();
         $spawnDisabled = false;
         $noDueObserved = false;
+        $nextSpawnAt = 0.0;
 
         while (true) {
             // Reap finished children.
@@ -892,11 +902,15 @@ try {
                         fclose($pipes[2]);
                     }
                     $exitCode = proc_close($proc);
-                    if ($exitCode === 0) {
-                        $successCount++;
-                        $noDueObserved = false;
-                    } elseif ($exitCode === 2) {
+                    if ($exitCode === 2) {
+                        if ($claimedOrReservedCount > 0) {
+                            $claimedOrReservedCount--;
+                        }
                         $noDueObserved = true;
+                        $nextSpawnAt = microtime(true) + ((float)$workerNoDueBackoffMillis / 1000.0);
+                    } else {
+                        $claimedCount++;
+                        $noDueObserved = false;
                     }
                 }
                 $i++;
@@ -904,16 +918,20 @@ try {
             $children = $nextChildren;
 
             $deadlineReached = ((time() - $runStartedTs) >= $workerMaxRunSeconds);
-            $jobLimitReached = ($launchedCount >= $workerMaxJobsPerRun);
+            $jobLimitReached = ($claimedOrReservedCount >= $workerMaxJobsPerRun);
             if (!$deadlineReached && !$jobLimitReached && !$spawnDisabled) {
-                while (count($children) < $workerGlobalConcurrency && $launchedCount < $workerMaxJobsPerRun && ((time() - $runStartedTs) < $workerMaxRunSeconds)) {
+                while (count($children) < $workerGlobalConcurrency && $claimedOrReservedCount < $workerMaxJobsPerRun && ((time() - $runStartedTs) < $workerMaxRunSeconds)) {
+                    if (microtime(true) < $nextSpawnAt) {
+                        break;
+                    }
                     $spawned = qrs_worker_spawn_child($scriptPath);
                     if ($spawned === false) {
                         $spawnDisabled = true;
                         break;
                     }
                     $children[] = $spawned;
-                    $launchedCount++;
+                    $spawnedCount++;
+                    $claimedOrReservedCount++;
                     $noDueObserved = false;
                 }
             }
@@ -927,7 +945,10 @@ try {
             usleep(200000);
         }
 
-        fwrite(STDOUT, '[qrs-worker] execute completed=' . $successCount . ' launched=' . $launchedCount . "\n");
+        if ($claimedCount > 0) {
+            $hadActivity = true;
+            fwrite(STDOUT, '[qrs-worker] execute completed=' . $claimedCount . ' spawned=' . $spawnedCount . ' claimed=' . $claimedCount . "\n");
+        }
     }
 } catch (Exception $e) {
     fwrite(STDERR, '[qrs-worker] execute phase failed: ' . $e->getMessage() . "\n");
@@ -935,6 +956,8 @@ try {
 }
 
 $endedAt = date('Y-m-d H:i:s');
-fwrite(STDOUT, '[qrs-worker] finished at ' . $endedAt . "\n");
+if ($hadActivity) {
+    fwrite(STDOUT, '[qrs-worker] finished at ' . $endedAt . "\n");
+}
 
 exit(0);
