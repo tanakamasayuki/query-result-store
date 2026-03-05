@@ -1,0 +1,23 @@
+config.php
+.env
+*.txt
+
+# local env overrides
+.env.local
+.env.*.local
+
+# runtime artifacts
+var/*
+!var/.gitkeep
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.pid
+*.lock
+
+# macOS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

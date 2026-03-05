@@ -1,0 +1,698 @@
+#!/usr/bin/env php
+<?php
+
+require_once dirname(__DIR__) . '/lib/bootstrap.php';
+require_once dirname(__DIR__) . '/lib/Repository/InstanceRepository.php';
+require_once dirname(__DIR__) . '/lib/Repository/DatasetRepository.php';
+require_once dirname(__DIR__) . '/lib/Repository/VariantRepository.php';
+require_once dirname(__DIR__) . '/lib/RedashClient.php';
+
+function qrs_worker_log_event($pdo, $variantId, $bucketAt, $level, $message, $status, $rowCount, $fetchSeconds, $context)
+{
+    $logId = uniqid('log_', true);
+    $ctx = '';
+    if (is_array($context)) {
+        $json = json_encode($context);
+        if (is_string($json)) {
+            $ctx = $json;
+        }
+    }
+
+    $sql = 'INSERT INTO qrs_sys_logs (log_id, variant_id, bucket_at, status, row_count, fetch_seconds, level, message, context_json, created_at) '
+        . 'VALUES (:log_id, :variant_id, :bucket_at, :status, :row_count, :fetch_seconds, :level, :message, :context_json, :created_at)';
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute(array(
+        ':log_id' => $logId,
+        ':variant_id' => $variantId,
+        ':bucket_at' => $bucketAt,
+        ':status' => $status,
+        ':row_count' => $rowCount,
+        ':fetch_seconds' => $fetchSeconds,
+        ':level' => $level,
+        ':message' => $message,
+        ':context_json' => $ctx,
+        ':created_at' => date('Y-m-d H:i:s'),
+    ));
+}
+
+function qrs_worker_quote_identifier($pdo, $name)
+{
+    $driver = '';
+    try {
+        $driver = (string)$pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+    } catch (Exception $e) {
+        $driver = '';
+    }
+    if ($driver === 'mysql') {
+        return '`' . str_replace('`', '``', (string)$name) . '`';
+    }
+    return '"' . str_replace('"', '""', (string)$name) . '"';
+}
+
+function qrs_worker_driver_name($pdo)
+{
+    try {
+        return (string)$pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+    } catch (Exception $e) {
+        return '';
+    }
+}
+
+function qrs_worker_storage_table_name($datasetId, $variantId)
+{
+    $base = 'qrs_d_' . (string)$datasetId . '_' . (string)$variantId;
+    $safe = preg_replace('/[^a-zA-Z0-9_]/', '_', $base);
+    if (!is_string($safe) || $safe === '') {
+        $safe = 'qrs_d_' . substr(sha1($base), 0, 16);
+    }
+    if (strlen($safe) > 60) {
+        $safe = substr($safe, 0, 44) . '_' . substr(sha1($safe), 0, 15);
+    }
+    return $safe;
+}
+
+function qrs_worker_extract_columns_rows($queryResult)
+{
+    $columns = array();
+    $rows = array();
+    if (!is_array($queryResult) || !isset($queryResult['data']) || !is_array($queryResult['data'])) {
+        return array($columns, $rows);
+    }
+
+    $data = $queryResult['data'];
+    if (isset($data['columns']) && is_array($data['columns'])) {
+        $i = 0;
+        while ($i < count($data['columns'])) {
+            $c = $data['columns'][$i];
+            if (is_array($c) && isset($c['name'])) {
+                $name = trim((string)$c['name']);
+                if ($name !== '') {
+                    $columns[] = $name;
+                }
+            }
+            $i++;
+        }
+    }
+    if (isset($data['rows']) && is_array($data['rows'])) {
+        $rows = $data['rows'];
+    }
+
+    if (count($columns) === 0 && count($rows) > 0 && is_array($rows[0])) {
+        foreach ($rows[0] as $k => $v) {
+            $name = trim((string)$k);
+            if ($name !== '') {
+                $columns[] = $name;
+            }
+        }
+    }
+
+    $uniq = array();
+    $normalized = array();
+    $j = 0;
+    while ($j < count($columns)) {
+        $n = (string)$columns[$j];
+        if (!isset($uniq[$n])) {
+            $uniq[$n] = true;
+            $normalized[] = $n;
+        }
+        $j++;
+    }
+
+    return array($normalized, $rows);
+}
+
+function qrs_worker_extract_column_type_map($queryResult)
+{
+    $map = array();
+    if (!is_array($queryResult) || !isset($queryResult['data']) || !is_array($queryResult['data'])) {
+        return $map;
+    }
+    $data = $queryResult['data'];
+    if (!isset($data['columns']) || !is_array($data['columns'])) {
+        return $map;
+    }
+    $i = 0;
+    while ($i < count($data['columns'])) {
+        $col = $data['columns'][$i];
+        if (is_array($col) && isset($col['name'])) {
+            $name = trim((string)$col['name']);
+            if ($name !== '' && !isset($map[$name])) {
+                $map[$name] = isset($col['type']) ? trim((string)$col['type']) : '';
+            }
+        }
+        $i++;
+    }
+    return $map;
+}
+
+function qrs_worker_decode_column_overrides($jsonText)
+{
+    $result = array();
+    if (!function_exists('json_decode')) {
+        return $result;
+    }
+    $data = json_decode((string)$jsonText, true);
+    if (!is_array($data)) {
+        return $result;
+    }
+    $allowed = QrsColumnTypeMapper::overrideTypes();
+    foreach ($data as $k => $v) {
+        $name = trim((string)$k);
+        $type = strtoupper(trim((string)$v));
+        if ($name === '' || $type === '' || !in_array($type, $allowed, true)) {
+            continue;
+        }
+        $result[$name] = $type;
+    }
+    return $result;
+}
+
+function qrs_worker_ensure_schema_and_table($pdo, $variantId, $tableName, $columns, $overrideMap, $detectedTypeMap)
+{
+    $selectStmt = $pdo->prepare('SELECT storage_table, locked_columns_json FROM qrs_sys_schema WHERE variant_id = :variant_id');
+    $selectStmt->execute(array(':variant_id' => $variantId));
+    $row = $selectStmt->fetch();
+
+    $sortedCurrent = $columns;
+    sort($sortedCurrent);
+
+    if ($row) {
+        $existingTable = isset($row['storage_table']) ? (string)$row['storage_table'] : '';
+        $existingCols = json_decode((string)$row['locked_columns_json'], true);
+        if (!is_array($existingCols)) {
+            throw new Exception('Invalid schema lock definition.');
+        }
+        $sortedExisting = $existingCols;
+        sort($sortedExisting);
+        if (count($sortedExisting) !== count($sortedCurrent) || $sortedExisting !== $sortedCurrent) {
+            throw new Exception('Schema mismatch detected for variant_id=' . $variantId);
+        }
+        if ($existingTable !== '') {
+            $tableName = $existingTable;
+        }
+    } else {
+        $insertStmt = $pdo->prepare(
+            'INSERT INTO qrs_sys_schema (variant_id, storage_table, locked_columns_json, locked_at, updated_at) VALUES (:variant_id, :storage_table, :locked_columns_json, :locked_at, :updated_at)'
+        );
+        $now = date('Y-m-d H:i:s');
+        $insertStmt->execute(array(
+            ':variant_id' => $variantId,
+            ':storage_table' => $tableName,
+            ':locked_columns_json' => json_encode($columns),
+            ':locked_at' => $now,
+            ':updated_at' => $now,
+        ));
+    }
+
+    $defs = array();
+    $defs[] = qrs_worker_quote_identifier($pdo, 'qrs_run_id') . ' TEXT NOT NULL';
+    $defs[] = qrs_worker_quote_identifier($pdo, 'qrs_bucket_at') . ' TEXT';
+    $defs[] = qrs_worker_quote_identifier($pdo, 'qrs_ingested_at') . ' TEXT NOT NULL';
+    $driver = qrs_worker_driver_name($pdo);
+    $i = 0;
+    while ($i < count($columns)) {
+        $colName = $columns[$i];
+        $overrideType = isset($overrideMap[$colName]) ? $overrideMap[$colName] : 'AUTO';
+        $redashType = isset($detectedTypeMap[$colName]) ? $detectedTypeMap[$colName] : '';
+        $sqlType = QrsColumnTypeMapper::resolveStorageType($driver, $redashType, $overrideType);
+        $defs[] = qrs_worker_quote_identifier($pdo, $colName) . ' ' . $sqlType;
+        $i++;
+    }
+    $sql = 'CREATE TABLE IF NOT EXISTS ' . qrs_worker_quote_identifier($pdo, $tableName) . ' (' . implode(', ', $defs) . ')';
+    $pdo->exec($sql);
+
+    return $tableName;
+}
+
+function qrs_worker_save_rows($pdo, $tableName, $mode, $bucketAt, $runId, $rows, $columns)
+{
+    $tableSql = qrs_worker_quote_identifier($pdo, $tableName);
+    if ($mode === 'snapshot') {
+        $deleteSql = 'DELETE FROM ' . $tableSql . ' WHERE ' . qrs_worker_quote_identifier($pdo, 'qrs_bucket_at') . ' = :bucket_at';
+        $deleteStmt = $pdo->prepare($deleteSql);
+        $deleteStmt->execute(array(':bucket_at' => $bucketAt));
+    } else {
+        $pdo->exec('DELETE FROM ' . $tableSql);
+    }
+
+    if (count($rows) === 0) {
+        return 0;
+    }
+
+    $insertCols = array('qrs_run_id', 'qrs_bucket_at', 'qrs_ingested_at');
+    $i = 0;
+    while ($i < count($columns)) {
+        $insertCols[] = $columns[$i];
+        $i++;
+    }
+
+    $colSql = array();
+    $paramSql = array();
+    $j = 0;
+    while ($j < count($insertCols)) {
+        $colSql[] = qrs_worker_quote_identifier($pdo, $insertCols[$j]);
+        $paramSql[] = '?';
+        $j++;
+    }
+
+    $insertSql = 'INSERT INTO ' . $tableSql . ' (' . implode(', ', $colSql) . ') VALUES (' . implode(', ', $paramSql) . ')';
+    $insertStmt = $pdo->prepare($insertSql);
+    $ingestedAt = date('Y-m-d H:i:s');
+    $count = 0;
+
+    $r = 0;
+    while ($r < count($rows)) {
+        $row = $rows[$r];
+        if (!is_array($row)) {
+            $row = array();
+        }
+        $params = array();
+        $params[] = $runId;
+        $params[] = ($mode === 'snapshot') ? $bucketAt : null;
+        $params[] = $ingestedAt;
+        $c = 0;
+        while ($c < count($columns)) {
+            $colName = $columns[$c];
+            $v = isset($row[$colName]) ? $row[$colName] : null;
+            if (is_array($v) || is_object($v)) {
+                $encoded = json_encode($v);
+                $v = is_string($encoded) ? $encoded : '';
+            } elseif ($v !== null && !is_scalar($v)) {
+                $v = (string)$v;
+            } elseif (is_bool($v)) {
+                $v = $v ? '1' : '0';
+            } elseif ($v !== null) {
+                $v = (string)$v;
+            }
+            $params[] = $v;
+            $c++;
+        }
+        $insertStmt->execute($params);
+        $count++;
+        $r++;
+    }
+
+    return $count;
+}
+
+function qrs_worker_find_due_buckets($pdo, $limit)
+{
+    $n = (int)$limit;
+    if ($n <= 0) {
+        $n = 20;
+    }
+    $now = date('Y-m-d H:i:s');
+    $sql = 'SELECT variant_id, bucket_at, status, priority, execute_after, attempt_count FROM qrs_sys_buckets '
+        . 'WHERE status IN (\'queued_scheduled\', \'queued_retry\', \'queued_manual\', \'queued_backfill\') '
+        . 'AND execute_after <= :now '
+        . 'ORDER BY priority DESC, execute_after ASC, bucket_at ASC '
+        . 'LIMIT ' . $n;
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute(array(':now' => $now));
+    return $stmt->fetchAll();
+}
+
+function qrs_worker_mark_running($pdo, $variantId, $bucketAt, $workerId)
+{
+    $now = date('Y-m-d H:i:s');
+    $sql = 'UPDATE qrs_sys_buckets SET status = :next_status, locked_by = :locked_by, locked_at = :locked_at, started_at = :started_at, '
+        . 'attempt_count = attempt_count + 1, updated_at = :updated_at '
+        . 'WHERE variant_id = :variant_id AND bucket_at = :bucket_at '
+        . 'AND status IN (\'queued_scheduled\', \'queued_retry\', \'queued_manual\', \'queued_backfill\')';
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute(array(
+        ':next_status' => 'running',
+        ':locked_by' => $workerId,
+        ':locked_at' => $now,
+        ':started_at' => $now,
+        ':updated_at' => $now,
+        ':variant_id' => $variantId,
+        ':bucket_at' => $bucketAt,
+    ));
+    return ($stmt->rowCount() > 0);
+}
+
+function qrs_worker_mark_success($pdo, $variantId, $bucketAt, $rowCount, $fetchSeconds)
+{
+    $now = date('Y-m-d H:i:s');
+    $sql = 'UPDATE qrs_sys_buckets SET status = :status, last_error = NULL, finished_at = :finished_at, '
+        . 'last_row_count = :last_row_count, last_fetch_seconds = :last_fetch_seconds, updated_at = :updated_at '
+        . 'WHERE variant_id = :variant_id AND bucket_at = :bucket_at';
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute(array(
+        ':status' => 'success',
+        ':finished_at' => $now,
+        ':last_row_count' => $rowCount,
+        ':last_fetch_seconds' => $fetchSeconds,
+        ':updated_at' => $now,
+        ':variant_id' => $variantId,
+        ':bucket_at' => $bucketAt,
+    ));
+}
+
+function qrs_worker_mark_failed($pdo, $variantId, $bucketAt, $errorMessage)
+{
+    $now = date('Y-m-d H:i:s');
+    $sql = 'UPDATE qrs_sys_buckets SET status = :status, last_error = :last_error, finished_at = :finished_at, updated_at = :updated_at '
+        . 'WHERE variant_id = :variant_id AND bucket_at = :bucket_at';
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute(array(
+        ':status' => 'failed',
+        ':last_error' => $errorMessage,
+        ':finished_at' => $now,
+        ':updated_at' => $now,
+        ':variant_id' => $variantId,
+        ':bucket_at' => $bucketAt,
+    ));
+}
+
+function qrs_worker_new_run_id()
+{
+    $rand = '';
+    if (function_exists('random_bytes')) {
+        try {
+            $rand = bin2hex(random_bytes(3));
+        } catch (Exception $e) {
+            $rand = '';
+        }
+    }
+    if ($rand === '') {
+        $rand = substr(sha1(uniqid('', true)), 0, 6);
+    }
+    return 'run_' . date('Ymd_His') . '_' . $rand;
+}
+
+function qrs_worker_get_meta($pdo, $key, $defaultValue)
+{
+    $sql = 'SELECT meta_value FROM qrs_sys_meta WHERE meta_key = :meta_key';
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute(array(':meta_key' => $key));
+    $row = $stmt->fetch();
+    if (!$row || !isset($row['meta_value'])) {
+        return $defaultValue;
+    }
+    return (string)$row['meta_value'];
+}
+
+function qrs_worker_resolve_store_dir($rootDir, $dirSetting)
+{
+    $dir = trim((string)$dirSetting);
+    if ($dir === '') {
+        $dir = 'var/redash_raw';
+    }
+    if (preg_match('/^(\/|[A-Za-z]:[\\\\\/])/', $dir)) {
+        return $dir;
+    }
+    return rtrim($rootDir, '/\\') . '/' . ltrim($dir, '/\\');
+}
+
+function qrs_worker_write_raw_payload($baseDir, $runId, $variantId, $bucketAt, $rawSource, $rawJson)
+{
+    $runPart = preg_replace('/[^a-zA-Z0-9_\-]/', '_', (string)$runId);
+    if (!is_string($runPart) || $runPart === '') {
+        $runPart = 'run_' . date('Ymd_His');
+    }
+    $variantPart = preg_replace('/[^a-zA-Z0-9_\-]/', '_', (string)$variantId);
+    if (!is_string($variantPart) || $variantPart === '') {
+        $variantPart = 'variant';
+    }
+    $bucketPart = preg_replace('/[^0-9]/', '', (string)$bucketAt);
+    if (!is_string($bucketPart) || $bucketPart === '') {
+        $bucketPart = date('YmdHis');
+    }
+    $sourcePart = preg_replace('/[^a-zA-Z0-9_\-]/', '_', (string)$rawSource);
+    if (!is_string($sourcePart) || $sourcePart === '') {
+        $sourcePart = 'raw';
+    }
+
+    $targetDir = rtrim($baseDir, '/\\') . '/' . $variantPart;
+    if (!is_dir($targetDir)) {
+        if (!@mkdir($targetDir, 0775, true)) {
+            throw new Exception('Failed to create raw payload directory: ' . $targetDir);
+        }
+    }
+    $name = $runPart . '_' . $variantPart . '_' . $bucketPart . '_' . $sourcePart . '.json';
+    $path = $targetDir . '/' . $name;
+    if (@file_put_contents($path, (string)$rawJson) === false) {
+        throw new Exception('Failed to write raw payload file: ' . $path);
+    }
+    return $path;
+}
+
+function qrs_worker_enqueue_bucket($pdo, $target)
+{
+    $variantId = isset($target['variant_id']) ? (string)$target['variant_id'] : '';
+    $bucketAt = isset($target['bucket_at']) ? (string)$target['bucket_at'] : '';
+    $executeAfter = isset($target['execute_after']) ? (string)$target['execute_after'] : date('Y-m-d H:i:s');
+    $priority = isset($target['priority']) ? (int)$target['priority'] : 0;
+    $status = isset($target['queue_status']) ? (string)$target['queue_status'] : 'queued_scheduled';
+
+    if ($variantId === '' || $bucketAt === '') {
+        return array('inserted' => false, 'reason' => 'invalid_target');
+    }
+
+    $selectSql = 'SELECT status FROM qrs_sys_buckets WHERE variant_id = :variant_id AND bucket_at = :bucket_at';
+    $selectStmt = $pdo->prepare($selectSql);
+    $selectStmt->execute(array(':variant_id' => $variantId, ':bucket_at' => $bucketAt));
+    $existing = $selectStmt->fetch();
+    if ($existing) {
+        return array('inserted' => false, 'reason' => 'already_exists');
+    }
+
+    $now = date('Y-m-d H:i:s');
+    $insertSql = 'INSERT INTO qrs_sys_buckets (variant_id, bucket_at, status, priority, execute_after, attempt_count, created_at, updated_at) '
+        . 'VALUES (:variant_id, :bucket_at, :status, :priority, :execute_after, 0, :created_at, :updated_at)';
+    $insertStmt = $pdo->prepare($insertSql);
+    $insertStmt->execute(array(
+        ':variant_id' => $variantId,
+        ':bucket_at' => $bucketAt,
+        ':status' => $status,
+        ':priority' => $priority,
+        ':execute_after' => $executeAfter,
+        ':created_at' => $now,
+        ':updated_at' => $now,
+    ));
+
+    return array('inserted' => true, 'reason' => 'created');
+}
+
+$rootDir = dirname(__DIR__);
+$config = QrsConfig::load($rootDir);
+QrsConfig::applyTimezone($config);
+$dbConfigExplicit = QrsConfig::hasExplicitDbConfig($rootDir);
+$runtimeErrors = QrsRuntime::validateRequiredExtensions();
+if (!$dbConfigExplicit) {
+    fwrite(STDERR, '[qrs-worker] DB config is not set. Create config.php or set .env values first.' . "\n");
+    exit(1);
+}
+if (count($runtimeErrors) > 0) {
+    fwrite(STDERR, '[qrs-worker] Runtime requirement error: ' . implode(' ', $runtimeErrors) . "\n");
+    exit(1);
+}
+
+try {
+    $pdo = QrsDb::connect($config);
+} catch (Exception $e) {
+    fwrite(STDERR, '[qrs-worker] DB connection failed: ' . $e->getMessage() . "\n");
+    exit(1);
+}
+
+if (!QrsDb::isInitialized($pdo)) {
+    fwrite(STDERR, '[qrs-worker] Core schema is not initialized. Open UI and run schema setup first.' . "\n");
+    exit(1);
+}
+
+$startedAt = date('Y-m-d H:i:s');
+fwrite(STDOUT, '[qrs-worker] started at ' . $startedAt . "\n");
+$storeRawPayload = false;
+$rawPayloadDir = qrs_worker_resolve_store_dir($rootDir, 'var/redash_raw');
+try {
+    $storeRawPayload = (qrs_worker_get_meta($pdo, 'runtime.store_raw_redash_payload', '0') === '1');
+    $rawPayloadDir = qrs_worker_resolve_store_dir($rootDir, qrs_worker_get_meta($pdo, 'runtime.raw_redash_payload_dir', 'var/redash_raw'));
+} catch (Exception $e) {
+    fwrite(STDERR, '[qrs-worker] failed to load runtime meta settings: ' . $e->getMessage() . "\n");
+}
+
+// Phase 1: dispatch-equivalent tasks.
+try {
+    $variantRepo = new QrsVariantRepository($pdo);
+    $allVariants = $variantRepo->findAllWithDataset('');
+    $nowTs = time();
+    $dispatchCount = 0;
+
+    foreach ($allVariants as $variant) {
+        if ((int)$variant['is_enabled'] !== 1) {
+            continue;
+        }
+
+        $targets = QrsDispatchPlanner::buildDispatchTargets(
+            $variant['variant_id'],
+            $variant['mode'],
+            $variant['schedule_json'],
+            $nowTs,
+            50
+        );
+
+        $i = 0;
+        while ($i < count($targets)) {
+            $t = $targets[$i];
+            $enqueue = qrs_worker_enqueue_bucket($pdo, $t);
+            if ($enqueue['inserted']) {
+                qrs_worker_log_event(
+                    $pdo,
+                    $t['variant_id'],
+                    $t['bucket_at'],
+                    'info',
+                    'bucket dispatched',
+                    isset($t['queue_status']) ? $t['queue_status'] : 'queued_scheduled',
+                    null,
+                    null,
+                    array(
+                        'priority' => isset($t['priority']) ? (int)$t['priority'] : 0,
+                        'execute_after' => isset($t['execute_after']) ? (string)$t['execute_after'] : null,
+                    )
+                );
+                fwrite(
+                    STDOUT,
+                    '[qrs-worker] dispatched variant=' . $t['variant_id']
+                    . ' bucket_at=' . $t['bucket_at']
+                    . ' priority=' . (isset($t['priority']) ? $t['priority'] : 0) . "\n"
+                );
+                $dispatchCount++;
+            } else {
+                fwrite(
+                    STDOUT,
+                    '[qrs-worker] skip dispatch variant=' . $t['variant_id']
+                    . ' bucket_at=' . $t['bucket_at']
+                    . ' reason=' . $enqueue['reason'] . "\n"
+                );
+            }
+            $i++;
+        }
+    }
+
+    fwrite(STDOUT, '[qrs-worker] dispatch inserted=' . $dispatchCount . "\n");
+} catch (Exception $e) {
+    fwrite(STDERR, '[qrs-worker] dispatch phase failed: ' . $e->getMessage() . "\n");
+    exit(1);
+}
+
+// Phase 2: execute-equivalent tasks.
+try {
+    $variantRepo = new QrsVariantRepository($pdo);
+    $datasetRepo = new QrsDatasetRepository($pdo);
+    $instanceRepo = new QrsInstanceRepository($pdo);
+    $client = new QrsRedashClient();
+    $workerId = gethostname() . ':' . getmypid();
+    $executeCount = 0;
+    $due = qrs_worker_find_due_buckets($pdo, 20);
+
+    $i = 0;
+    while ($i < count($due)) {
+        $bucket = $due[$i];
+        $variantId = isset($bucket['variant_id']) ? (string)$bucket['variant_id'] : '';
+        $bucketAt = isset($bucket['bucket_at']) ? (string)$bucket['bucket_at'] : '';
+        if ($variantId === '' || $bucketAt === '') {
+            $i++;
+            continue;
+        }
+
+        if (!qrs_worker_mark_running($pdo, $variantId, $bucketAt, $workerId)) {
+            $i++;
+            continue;
+        }
+
+        qrs_worker_log_event($pdo, $variantId, $bucketAt, 'info', 'bucket execution started', 'running', null, null, array());
+        try {
+            $variant = $variantRepo->findById($variantId);
+            if ($variant === null) {
+                throw new Exception('Variant not found.');
+            }
+            $dataset = $datasetRepo->findById($variant['dataset_id']);
+            if ($dataset === null) {
+                throw new Exception('Dataset not found.');
+            }
+            $instance = $instanceRepo->findById($dataset['instance_id']);
+            if ($instance === null || (int)$instance['is_enabled'] !== 1) {
+                throw new Exception('Instance not found or disabled.');
+            }
+
+            $nowTs = time();
+            $params = QrsDispatchPlanner::resolveParameterValues($variant['parameter_json'], $nowTs, $bucketAt);
+
+            $fetchStarted = microtime(true);
+            $exec = $client->executeQuery($instance['base_url'], $instance['api_key'], $dataset['query_id'], $params, 60);
+            $fetchSeconds = microtime(true) - $fetchStarted;
+            if (!$exec['ok']) {
+                throw new Exception($exec['message'] . ' (HTTP ' . (string)$exec['status_code'] . ')');
+            }
+
+            list($columns, $rows) = qrs_worker_extract_columns_rows($exec['query_result']);
+            $detectedTypeMap = qrs_worker_extract_column_type_map($exec['query_result']);
+            if (count($columns) === 0 && count($rows) > 0) {
+                throw new Exception('No columns in query result.');
+            }
+
+            $tableName = qrs_worker_storage_table_name($dataset['dataset_id'], $variantId);
+            $overrideMap = qrs_worker_decode_column_overrides(
+                isset($variant['column_type_overrides_json']) ? $variant['column_type_overrides_json'] : '{}'
+            );
+            $tableName = qrs_worker_ensure_schema_and_table($pdo, $variantId, $tableName, $columns, $overrideMap, $detectedTypeMap);
+
+            $runId = qrs_worker_new_run_id();
+            $rawSavedPath = '';
+            if ($storeRawPayload && isset($exec['raw_json'])) {
+                $rawSavedPath = qrs_worker_write_raw_payload(
+                    $rawPayloadDir,
+                    $runId,
+                    $variantId,
+                    $bucketAt,
+                    isset($exec['raw_source']) ? (string)$exec['raw_source'] : 'raw',
+                    (string)$exec['raw_json']
+                );
+            }
+            $pdo->beginTransaction();
+            try {
+                $rowCount = qrs_worker_save_rows($pdo, $tableName, $variant['mode'], $bucketAt, $runId, $rows, $columns);
+                qrs_worker_mark_success($pdo, $variantId, $bucketAt, $rowCount, $fetchSeconds);
+                $pdo->commit();
+            } catch (Exception $saveEx) {
+                $pdo->rollBack();
+                throw $saveEx;
+            }
+
+            qrs_worker_log_event(
+                $pdo,
+                $variantId,
+                $bucketAt,
+                'info',
+                'bucket execution succeeded',
+                'success',
+                $rowCount,
+                $fetchSeconds,
+                array(
+                    'storage_table' => $tableName,
+                    'raw_payload_path' => $rawSavedPath
+                )
+            );
+            fwrite(STDOUT, '[qrs-worker] executed variant=' . $variantId . ' bucket_at=' . $bucketAt . ' rows=' . $rowCount . "\n");
+            $executeCount++;
+        } catch (Exception $e) {
+            qrs_worker_mark_failed($pdo, $variantId, $bucketAt, $e->getMessage());
+            qrs_worker_log_event($pdo, $variantId, $bucketAt, 'error', 'bucket execution failed: ' . $e->getMessage(), 'failed', null, null, array());
+            fwrite(STDERR, '[qrs-worker] execute failed variant=' . $variantId . ' bucket_at=' . $bucketAt . ' error=' . $e->getMessage() . "\n");
+        }
+
+        $i++;
+    }
+
+    fwrite(STDOUT, '[qrs-worker] execute completed=' . $executeCount . "\n");
+} catch (Exception $e) {
+    fwrite(STDERR, '[qrs-worker] execute phase failed: ' . $e->getMessage() . "\n");
+    exit(1);
+}
+
+$endedAt = date('Y-m-d H:i:s');
+fwrite(STDOUT, '[qrs-worker] finished at ' . $endedAt . "\n");
+
+exit(0);
