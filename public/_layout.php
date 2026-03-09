@@ -48,6 +48,9 @@ function qrs_render_header($activePage, $pageTitle, $message, $error)
     <a href="<?php echo h(qrs_lang_switch_url('en')); ?>"><?php echo h(t('lang_en', array())); ?></a>
     |
     <a href="<?php echo h(qrs_lang_switch_url('ja')); ?>"><?php echo h(t('lang_ja', array())); ?></a>
+    |
+    <strong><?php echo h(t('version_label', array())); ?>:</strong>
+    <code><?php echo h(qrs_app_version()); ?></code>
   </div>
 
   <div class="tabs">

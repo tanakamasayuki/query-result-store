@@ -5,6 +5,14 @@ require_once dirname(__DIR__) . '/lib/Repository/InstanceRepository.php';
 require_once dirname(__DIR__) . '/lib/RedashClient.php';
 
 $rootDir = dirname(__DIR__);
+$versionFile = $rootDir . '/version.php';
+$appVersion = '0.1.0';
+if (is_file($versionFile)) {
+    $loadedVersion = include $versionFile;
+    if (is_string($loadedVersion) && trim($loadedVersion) !== '') {
+        $appVersion = trim($loadedVersion);
+    }
+}
 $workerPath = $rootDir . '/bin/worker.php';
 $workerLockPath = $rootDir . '/var/qrs-worker.lock';
 $config = QrsConfig::load($rootDir);
@@ -75,6 +83,12 @@ function qrs_lang_switch_url($lang)
 function qrs_lang_input_html()
 {
     return '<input type="hidden" name="lang" value="' . h(qrs_lang()) . '">';
+}
+
+function qrs_app_version()
+{
+    global $appVersion;
+    return $appVersion;
 }
 
 function maskApiKey($apiKey)

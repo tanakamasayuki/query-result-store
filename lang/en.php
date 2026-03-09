@@ -3,6 +3,7 @@
 return array(
     'app_title' => 'QRS (Query Result Store) Setup',
     'app_name' => 'QRS (Query Result Store)',
+    'version_label' => 'Version',
     'db_status' => 'DB Status',
     'runtime_status' => 'Runtime Status',
     'runtime_settings_box' => 'Runtime Settings',
