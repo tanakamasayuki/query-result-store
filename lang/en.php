@@ -17,6 +17,8 @@ return array(
     'runtime_setting_worker_poll_timeout_seconds' => 'Redash polling timeout seconds (worker.poll_timeout_seconds)',
     'runtime_setting_worker_poll_interval_millis' => 'Redash polling interval milliseconds (worker.poll_interval_millis)',
     'runtime_setting_worker_running_stale_seconds' => 'Running stale recovery seconds (worker.running_stale_seconds)',
+    'runtime_setting_worker_retry_max_count' => 'Automatic retry max count (worker.retry_max_count)',
+    'runtime_setting_worker_retry_backoff_seconds' => 'Automatic retry base backoff seconds (worker.retry_backoff_seconds)',
     'runtime_settings_save_button' => 'Save runtime settings',
     'runtime_settings_saved' => 'Runtime settings saved.',
     'runtime_settings_save_error' => 'Failed to save runtime settings: {message}',

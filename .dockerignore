@@ -1,0 +1,9 @@
+.git
+.gitignore
+var
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.pid
+*.lock

@@ -38,6 +38,28 @@ Minimal implementation skeleton for the QRS requirements.
    * * * * * flock -n /var/lock/qrs-worker.lock php /home/mt/dev/query-result-store/bin/worker.php
    ```
 
+## Docker quick start
+
+1. Start container:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+   If you get file write permission errors for `config.php` or `var/`, run with your host UID/GID:
+
+   ```bash
+   UID=$(id -u) GID=$(id -g) docker compose up -d --build
+   ```
+
+2. Open `http://127.0.0.1:8080`.
+
+3. Run worker manually in container:
+
+   ```bash
+   docker compose exec web php bin/worker.php
+   ```
+
 ## Notes
 
 - Single worker entrypoint: `bin/worker.php`

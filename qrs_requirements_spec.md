@@ -204,6 +204,12 @@ Primary settings:
 -   `worker.running_stale_seconds`
     -   seconds before reclaiming tasks left in `running` state as `queued_retry`
     -   recommended initial value: `900`
+-   `worker.retry_max_count`
+    -   maximum automatic retry count (how many times to requeue after first failure)
+    -   recommended initial value: `3`
+-   `worker.retry_backoff_seconds`
+    -   base wait seconds for automatic retry (used in exponential backoff)
+    -   recommended initial value: `60`
 
 Termination behavior:
 
@@ -214,6 +220,7 @@ Termination behavior:
 
 -   on worker startup, records in `running` with `locked_at` older than `running_stale_seconds` are moved to `queued_retry`
 -   clear `locked_by`, `locked_at`, `started_at`, and record an automatic recovery reason in `last_error`
+-   if any `running` rows still remain after recovery, Worker exits with error and does not start dispatch/execute
 
 Default rationale:
 
@@ -233,24 +240,29 @@ Note:
 
 # 10. Execution Priority
 
-Dispatcher processes tasks in the following order:
+Worker processes tasks in the following order:
 
-1.  Scheduled runs
-2.  Retry of failed runs
-3.  Manual single executions
-4.  Backfill executions
+1.  Manual single executions
+2.  Scheduled runs
+3.  Backfill executions
+4.  Retry of failed runs (always last)
 
 Priorities are managed with fixed numeric values (higher number = higher priority):
 
 -   `queued_scheduled`: `400`
--   `queued_retry`: `300`
 -   `queued_manual`: `200`
 -   `queued_backfill` (including lookback): `100`
+-   `queued_retry`: `50` (fixed as the last class)
 
 Execution order within the same priority:
 
 -   ascending `execute_at` / `execute_after` (older time first)
 -   if candidates still tie on both priority and time, final ordering is defined by Worker implementation
+
+Notes:
+
+-   implementation compares queue class order first (`manual/scheduled/backfill/retry`), then numeric `priority`
+-   therefore `queued_retry` does not run before non-retry tasks even if its numeric priority is higher
 
 ------------------------------------------------------------------------
 
@@ -261,6 +273,12 @@ Failed runs:
 -   are retried automatically
 -   have a configurable retry limit
 -   stop retrying once the limit is reached
+-   set delayed `execute_after` before retrying
+
+Retry wait uses exponential backoff:
+
+-   next wait seconds = `retry_backoff_seconds * 2^(retry_attempt - 1)`
+-   example with `60`: `60s, 120s, 240s ...`
 
 Users may manually trigger re-execution.
 

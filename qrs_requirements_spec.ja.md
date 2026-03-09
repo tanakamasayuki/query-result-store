@@ -199,6 +199,12 @@ Worker は `qrs_sys_meta` の運用設定を参照して挙動を制御する。
 -   `worker.running_stale_seconds`
     -   `running` 状態のまま停止したタスクを `queued_retry` に戻すまでの秒数
     -   推奨初期値: `900`
+-   `worker.retry_max_count`
+    -   自動リトライの上限回数（初回失敗後に再投入できる最大回数）
+    -   推奨初期値: `3`
+-   `worker.retry_backoff_seconds`
+    -   自動リトライの基本待機秒数（指数バックオフの基準値）
+    -   推奨初期値: `60`
 
 終了条件:
 
@@ -209,6 +215,7 @@ Worker は `qrs_sys_meta` の運用設定を参照して挙動を制御する。
 
 -   Worker 起動時に `running` かつ `locked_at` が `running_stale_seconds` を超過したレコードを検出し、`queued_retry` に戻す
 -   `locked_by`, `locked_at`, `started_at` はクリアし、`last_error` に自動復旧理由を記録する
+-   復旧後も `running` レコードが残る場合、Worker は異常終了し、dispatch/execute を開始しない
 
 デフォルト値の考え方:
 
@@ -228,24 +235,29 @@ Worker は `qrs_sys_meta` の運用設定を参照して挙動を制御する。
 
 # 10. 実行優先度
 
-ディスパッチャは以下の順でタスクを処理します:
+Worker は以下の順でタスクを処理します:
 
-1.  スケジュール実行
-2.  失敗実行のリトライ
-3.  手動単発実行
-4.  Backfill 実行
+1.  手動単発実行
+2.  スケジュール実行
+3.  Backfill 実行
+4.  失敗実行のリトライ（常に最後）
 
 優先度は固定値（数値が大きいほど高優先）で管理します:
 
 -   `queued_scheduled`: `400`
--   `queued_retry`: `300`
 -   `queued_manual`: `200`
 -   `queued_backfill`（lookback を含む）: `100`
+-   `queued_retry`: `50`（固定で最後に回す）
 
 同一優先度内の実行順:
 
 -   `execute_at` / `execute_after` の昇順（古い時刻から先に実行）
 -   同一優先度かつ同時刻で複数候補がある場合の最終決定は Worker 実装仕様に委ねる
+
+注記:
+
+-   実装上は `status` のカテゴリ順（`manual/scheduled/backfill/retry`）を優先し、その後に `priority` を比較する
+-   そのため、`queued_retry` は元の `priority` 値が高くても、非リトライタスクより先に実行しない
 
 ------------------------------------------------------------------------
 
@@ -256,6 +268,12 @@ Worker は `qrs_sys_meta` の運用設定を参照して挙動を制御する。
 -   自動でリトライされる
 -   設定可能なリトライ上限を持つ
 -   上限到達後はリトライを停止する
+-   リトライ時は `execute_after` に待機時間を設定する
+
+リトライ待機は指数バックオフ:
+
+-   `retry_backoff_seconds * 2^(retry_attempt - 1)` を次回待機秒数として使用
+-   例: `60` 秒設定なら `60s, 120s, 240s ...`
 
 ユーザーは手動で再実行をトリガーできます。
 

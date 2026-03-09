@@ -9,7 +9,7 @@ class QrsDispatchPlanner
             return 400;
         }
         if ($s === 'queued_retry') {
-            return 300;
+            return 50;
         }
         if ($s === 'queued_manual') {
             return 200;

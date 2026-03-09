@@ -148,6 +148,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $runtimeOk && $dbOk) {
                 if ($workerRunningStaleSeconds < 1) {
                     $workerRunningStaleSeconds = 1;
                 }
+                $workerRetryMaxCount = isset($_POST['worker_retry_max_count']) ? (int)$_POST['worker_retry_max_count'] : 3;
+                if ($workerRetryMaxCount < 0) {
+                    $workerRetryMaxCount = 0;
+                }
+                $workerRetryBackoffSeconds = isset($_POST['worker_retry_backoff_seconds']) ? (int)$_POST['worker_retry_backoff_seconds'] : 60;
+                if ($workerRetryBackoffSeconds < 1) {
+                    $workerRetryBackoffSeconds = 1;
+                }
                 $metaRepo->set('runtime.store_raw_redash_payload', $storeRaw);
                 $metaRepo->set('runtime.raw_redash_payload_dir', $rawDir);
                 $metaRepo->set('worker.global_concurrency', (string)$workerGlobalConcurrency);
@@ -156,6 +164,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $runtimeOk && $dbOk) {
                 $metaRepo->set('worker.poll_timeout_seconds', (string)$workerPollTimeoutSeconds);
                 $metaRepo->set('worker.poll_interval_millis', (string)$workerPollIntervalMillis);
                 $metaRepo->set('worker.running_stale_seconds', (string)$workerRunningStaleSeconds);
+                $metaRepo->set('worker.retry_max_count', (string)$workerRetryMaxCount);
+                $metaRepo->set('worker.retry_backoff_seconds', (string)$workerRetryBackoffSeconds);
                 foreach ($_POST as $postKey => $postValue) {
                     if (strpos($postKey, 'meta_') !== 0) {
                         continue;
@@ -215,6 +225,8 @@ $runtimeWorkerMaxJobsPerRun = '20';
 $runtimeWorkerPollTimeoutSeconds = '300';
 $runtimeWorkerPollIntervalMillis = '1000';
 $runtimeWorkerRunningStaleSeconds = '900';
+$runtimeWorkerRetryMaxCount = '3';
+$runtimeWorkerRetryBackoffSeconds = '60';
 if ($dbOk && $isInitialized) {
     try {
         $metaRepo = new QrsMetaRepository($pdo);
@@ -249,6 +261,14 @@ if ($dbOk && $isInitialized) {
         $runtimeWorkerRunningStaleSeconds = trim($metaRepo->get('worker.running_stale_seconds', '900'));
         if ($runtimeWorkerRunningStaleSeconds === '') {
             $runtimeWorkerRunningStaleSeconds = '900';
+        }
+        $runtimeWorkerRetryMaxCount = trim($metaRepo->get('worker.retry_max_count', '3'));
+        if ($runtimeWorkerRetryMaxCount === '') {
+            $runtimeWorkerRetryMaxCount = '3';
+        }
+        $runtimeWorkerRetryBackoffSeconds = trim($metaRepo->get('worker.retry_backoff_seconds', '60'));
+        if ($runtimeWorkerRetryBackoffSeconds === '') {
+            $runtimeWorkerRetryBackoffSeconds = '60';
         }
     } catch (Exception $e) {
         $error = t('runtime_settings_load_error', array('message' => $e->getMessage()));
@@ -376,6 +396,12 @@ qrs_render_header('env', t('app_title', array()), $message, $error);
 
       <label><?php echo h(t('runtime_setting_worker_running_stale_seconds', array())); ?></label>
       <input type="text" name="worker_running_stale_seconds" value="<?php echo h($runtimeWorkerRunningStaleSeconds); ?>">
+
+      <label><?php echo h(t('runtime_setting_worker_retry_max_count', array())); ?></label>
+      <input type="text" name="worker_retry_max_count" value="<?php echo h($runtimeWorkerRetryMaxCount); ?>">
+
+      <label><?php echo h(t('runtime_setting_worker_retry_backoff_seconds', array())); ?></label>
+      <input type="text" name="worker_retry_backoff_seconds" value="<?php echo h($runtimeWorkerRetryBackoffSeconds); ?>">
 
       <div style="margin-top:10px;">
         <button type="submit"><?php echo h(t('runtime_settings_save_button', array())); ?></button>

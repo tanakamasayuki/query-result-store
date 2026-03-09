@@ -1,0 +1,14 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    environment:
+      TZ: Asia/Tokyo
+      QRS_TIMEZONE: Asia/Tokyo
+      APACHE_RUN_USER: "#${UID:-1000}"
+      APACHE_RUN_GROUP: "#${GID:-1000}"
+    volumes:
+      - ./:/var/www/html

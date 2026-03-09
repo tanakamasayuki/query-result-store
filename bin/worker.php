@@ -313,7 +313,13 @@ function qrs_worker_find_due_buckets($pdo, $limit)
     $sql = 'SELECT variant_id, bucket_at, status, priority, execute_after, attempt_count FROM qrs_sys_buckets '
         . 'WHERE status IN (\'queued_scheduled\', \'queued_retry\', \'queued_manual\', \'queued_backfill\') '
         . 'AND execute_after <= :now '
-        . 'ORDER BY priority DESC, execute_after ASC, bucket_at ASC '
+        . 'ORDER BY CASE status '
+        . '  WHEN \'queued_manual\' THEN 1 '
+        . '  WHEN \'queued_scheduled\' THEN 2 '
+        . '  WHEN \'queued_backfill\' THEN 3 '
+        . '  WHEN \'queued_retry\' THEN 4 '
+        . '  ELSE 9 END ASC, '
+        . 'priority DESC, execute_after ASC, bucket_at ASC '
         . 'LIMIT ' . $n;
     $stmt = $pdo->prepare($sql);
     $stmt->execute(array(':now' => $now));
@@ -337,7 +343,13 @@ function qrs_worker_find_due_buckets_claimable($pdo, $limit)
         . '  INNER JOIN qrs_sys_variants rv ON rv.variant_id = rb.variant_id '
         . '  WHERE rb.status = \'running\' AND rv.dataset_id = v.dataset_id'
         . ') '
-        . 'ORDER BY b.priority DESC, b.execute_after ASC, b.bucket_at ASC '
+        . 'ORDER BY CASE b.status '
+        . '  WHEN \'queued_manual\' THEN 1 '
+        . '  WHEN \'queued_scheduled\' THEN 2 '
+        . '  WHEN \'queued_backfill\' THEN 3 '
+        . '  WHEN \'queued_retry\' THEN 4 '
+        . '  ELSE 9 END ASC, '
+        . 'b.priority DESC, b.execute_after ASC, b.bucket_at ASC '
         . 'LIMIT ' . $n;
     $stmt = $pdo->prepare($sql);
     $stmt->execute(array(':now' => $now));
@@ -419,20 +431,67 @@ function qrs_worker_mark_success($pdo, $variantId, $bucketAt, $rowCount, $fetchS
     ));
 }
 
-function qrs_worker_mark_failed($pdo, $variantId, $bucketAt, $errorMessage)
+function qrs_worker_retry_delay_seconds($attemptCount, $baseSeconds)
 {
+    $attempt = (int)$attemptCount;
+    if ($attempt < 1) {
+        $attempt = 1;
+    }
+    $base = (int)$baseSeconds;
+    if ($base < 1) {
+        $base = 60;
+    }
+    $delay = (int)round($base * pow(2, $attempt - 1));
+    if ($delay < 1) {
+        $delay = 1;
+    }
+    if ($delay > 604800) {
+        $delay = 604800;
+    }
+    return $delay;
+}
+
+function qrs_worker_mark_failed($pdo, $variantId, $bucketAt, $errorMessage, $retryMaxCount, $retryBackoffSeconds)
+{
+    $selectSql = 'SELECT attempt_count FROM qrs_sys_buckets WHERE variant_id = :variant_id AND bucket_at = :bucket_at';
+    $selectStmt = $pdo->prepare($selectSql);
+    $selectStmt->execute(array(
+        ':variant_id' => $variantId,
+        ':bucket_at' => $bucketAt,
+    ));
+    $row = $selectStmt->fetch();
+    $attemptCount = ($row && isset($row['attempt_count'])) ? (int)$row['attempt_count'] : 1;
+
+    $retryMax = (int)$retryMaxCount;
+    if ($retryMax < 0) {
+        $retryMax = 0;
+    }
+
+    $isRetry = ($attemptCount <= $retryMax);
     $now = date('Y-m-d H:i:s');
-    $sql = 'UPDATE qrs_sys_buckets SET status = :status, last_error = :last_error, finished_at = :finished_at, updated_at = :updated_at '
+    $retryDelay = qrs_worker_retry_delay_seconds($attemptCount, $retryBackoffSeconds);
+    $executeAfter = $isRetry ? date('Y-m-d H:i:s', time() + $retryDelay) : $now;
+    $status = $isRetry ? 'queued_retry' : 'failed';
+
+    $sql = 'UPDATE qrs_sys_buckets SET status = :status, execute_after = :execute_after, '
+        . 'locked_by = NULL, locked_at = NULL, last_error = :last_error, finished_at = :finished_at, updated_at = :updated_at '
         . 'WHERE variant_id = :variant_id AND bucket_at = :bucket_at';
     $stmt = $pdo->prepare($sql);
     $stmt->execute(array(
-        ':status' => 'failed',
+        ':status' => $status,
+        ':execute_after' => $executeAfter,
         ':last_error' => $errorMessage,
         ':finished_at' => $now,
         ':updated_at' => $now,
         ':variant_id' => $variantId,
         ':bucket_at' => $bucketAt,
     ));
+    return array(
+        'status' => $status,
+        'attempt_count' => $attemptCount,
+        'retry_delay_seconds' => $isRetry ? $retryDelay : 0,
+        'execute_after' => $executeAfter,
+    );
 }
 
 function qrs_worker_recover_stale_running($pdo, $staleSeconds)
@@ -634,7 +693,7 @@ function qrs_worker_enqueue_bucket($pdo, $target)
     return array('inserted' => true, 'reason' => 'created');
 }
 
-function qrs_worker_execute_claimed_bucket($pdo, $variantRepo, $datasetRepo, $instanceRepo, $client, $variantId, $bucketAt, $storeRawPayload, $rawPayloadDir, $pollTimeoutSeconds, $pollIntervalMillis)
+function qrs_worker_execute_claimed_bucket($pdo, $variantRepo, $datasetRepo, $instanceRepo, $client, $variantId, $bucketAt, $storeRawPayload, $rawPayloadDir, $pollTimeoutSeconds, $pollIntervalMillis, $retryMaxCount, $retryBackoffSeconds)
 {
     qrs_worker_log_event($pdo, $variantId, $bucketAt, 'info', 'bucket execution started', 'running', null, null, array());
     try {
@@ -719,9 +778,32 @@ function qrs_worker_execute_claimed_bucket($pdo, $variantRepo, $datasetRepo, $in
         fwrite(STDOUT, '[qrs-worker] executed variant=' . $variantId . ' bucket_at=' . $bucketAt . ' rows=' . $rowCount . "\n");
         return true;
     } catch (Exception $e) {
-        qrs_worker_mark_failed($pdo, $variantId, $bucketAt, $e->getMessage());
-        qrs_worker_log_event($pdo, $variantId, $bucketAt, 'error', 'bucket execution failed: ' . $e->getMessage(), 'failed', null, null, array());
-        fwrite(STDERR, '[qrs-worker] execute failed variant=' . $variantId . ' bucket_at=' . $bucketAt . ' error=' . $e->getMessage() . "\n");
+        $failed = qrs_worker_mark_failed($pdo, $variantId, $bucketAt, $e->getMessage(), $retryMaxCount, $retryBackoffSeconds);
+        $nextStatus = isset($failed['status']) ? (string)$failed['status'] : 'failed';
+        $retryDelay = isset($failed['retry_delay_seconds']) ? (int)$failed['retry_delay_seconds'] : 0;
+        $nextExecuteAfter = isset($failed['execute_after']) ? (string)$failed['execute_after'] : '';
+        qrs_worker_log_event(
+            $pdo,
+            $variantId,
+            $bucketAt,
+            'error',
+            'bucket execution failed: ' . $e->getMessage(),
+            $nextStatus,
+            null,
+            null,
+            array(
+                'retry_delay_seconds' => $retryDelay,
+                'next_execute_after' => $nextExecuteAfter,
+            )
+        );
+        fwrite(
+            STDERR,
+            '[qrs-worker] execute failed variant=' . $variantId
+            . ' bucket_at=' . $bucketAt
+            . ' status=' . $nextStatus
+            . ' retry_after=' . $nextExecuteAfter
+            . ' error=' . $e->getMessage() . "\n"
+        );
         return false;
     }
 }
@@ -789,6 +871,8 @@ $workerPollTimeoutSeconds = 300;
 $workerPollIntervalMillis = 1000;
 $workerNoDueBackoffMillis = 1000;
 $workerRunningStaleSeconds = 900;
+$workerRetryMaxCount = 3;
+$workerRetryBackoffSeconds = 60;
 try {
     $storeRawPayload = (qrs_worker_get_meta($pdo, 'runtime.store_raw_redash_payload', '0') === '1');
     $rawPayloadDir = qrs_worker_resolve_store_dir($rootDir, qrs_worker_get_meta($pdo, 'runtime.raw_redash_payload_dir', 'var/redash_raw'));
@@ -798,6 +882,8 @@ try {
     $workerPollTimeoutSeconds = qrs_worker_get_meta_int($pdo, 'worker.poll_timeout_seconds', 300, 1, 86400);
     $workerPollIntervalMillis = qrs_worker_get_meta_int($pdo, 'worker.poll_interval_millis', 1000, 100, 60000);
     $workerRunningStaleSeconds = qrs_worker_get_meta_int($pdo, 'worker.running_stale_seconds', 900, 1, 86400);
+    $workerRetryMaxCount = qrs_worker_get_meta_int($pdo, 'worker.retry_max_count', 3, 0, 1000);
+    $workerRetryBackoffSeconds = qrs_worker_get_meta_int($pdo, 'worker.retry_backoff_seconds', 60, 1, 86400);
 } catch (Exception $e) {
     fwrite(STDERR, '[qrs-worker] failed to load runtime meta settings: ' . $e->getMessage() . "\n");
 }
@@ -918,7 +1004,9 @@ try {
             $storeRawPayload,
             $rawPayloadDir,
             $workerPollTimeoutSeconds,
-            $workerPollIntervalMillis
+            $workerPollIntervalMillis,
+            $workerRetryMaxCount,
+            $workerRetryBackoffSeconds
         );
         exit(0);
     }
@@ -953,7 +1041,9 @@ try {
                 $storeRawPayload,
                 $rawPayloadDir,
                 $workerPollTimeoutSeconds,
-                $workerPollIntervalMillis
+                $workerPollIntervalMillis,
+                $workerRetryMaxCount,
+                $workerRetryBackoffSeconds
             );
             $executeCount++;
         }

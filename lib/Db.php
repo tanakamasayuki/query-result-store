@@ -163,6 +163,8 @@ class QrsDb
                 'worker.poll_timeout_seconds' => '300',
                 'worker.poll_interval_millis' => '1000',
                 'worker.running_stale_seconds' => '900',
+                'worker.retry_max_count' => '3',
+                'worker.retry_backoff_seconds' => '60',
             );
             $upsertMetaStmt = $pdo->prepare(
                 'INSERT OR IGNORE INTO qrs_sys_meta (meta_key, meta_value, updated_at) VALUES (:meta_key, :meta_value, :updated_at)'
