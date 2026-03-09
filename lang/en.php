@@ -29,6 +29,8 @@ return array(
     'db_failed' => 'Connection failed: {message}',
     'db_config_missing' => 'DB config is not set. Configure config.php or .env from Environment page first.',
     'db_retry_hint' => 'When DB connection fails, you can save settings and retry.',
+    'db_password_hidden' => '(hidden)',
+    'db_password_configured' => 'Password configured: {value}',
     'driver_label' => 'driver',
     'schema_ready' => 'Core schema: initialized',
     'schema_missing' => 'Core schema: not initialized',

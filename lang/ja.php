@@ -29,6 +29,8 @@ return array(
     'db_failed' => '接続失敗: {message}',
     'db_config_missing' => 'DB設定が未指定です。環境画面で config.php または .env を設定してください。',
     'db_retry_hint' => '接続失敗時は設定を保存して再試行できます。',
+    'db_password_hidden' => '（非表示）',
+    'db_password_configured' => 'パスワード設定済み: {value}',
     'driver_label' => 'driver',
     'schema_ready' => '初期スキーマ: 作成済み',
     'schema_missing' => '初期スキーマ: 未作成',

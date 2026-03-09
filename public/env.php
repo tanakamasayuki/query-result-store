@@ -345,6 +345,21 @@ qrs_render_header('env', t('app_title', array()), $message, $error);
   <?php elseif ($dbOk): ?>
     <p class="ok"><?php echo h(t('db_connected', array())); ?></p>
     <p><?php echo h(t('driver_label', array())); ?>: <code><?php echo h(isset($db['driver']) ? $db['driver'] : ''); ?></code></p>
+    <?php $dbDriver = isset($db['driver']) ? strtolower((string)$db['driver']) : ''; ?>
+    <?php if ($dbDriver === 'sqlite'): ?>
+      <p><?php echo h(t('field_sqlite_path', array())); ?>: <code><?php echo h(isset($db['sqlite_path']) ? (string)$db['sqlite_path'] : ''); ?></code></p>
+    <?php else: ?>
+      <p><?php echo h(t('field_host', array())); ?>: <code><?php echo h(isset($db['host']) ? (string)$db['host'] : ''); ?></code></p>
+      <p><?php echo h(t('field_port', array())); ?>: <code><?php echo h(isset($db['port']) ? (string)$db['port'] : ''); ?></code></p>
+      <p><?php echo h(t('field_name', array())); ?>: <code><?php echo h(isset($db['name']) ? (string)$db['name'] : ''); ?></code></p>
+      <p><?php echo h(t('field_user', array())); ?>: <code><?php echo h(isset($db['user']) ? (string)$db['user'] : ''); ?></code></p>
+      <?php if ($dbDriver === 'mysql'): ?>
+        <p><?php echo h(t('field_charset', array())); ?>: <code><?php echo h(isset($db['charset']) ? (string)$db['charset'] : ''); ?></code></p>
+      <?php endif; ?>
+    <?php endif; ?>
+    <?php $passwordSet = (isset($db['password']) && trim((string)$db['password']) !== ''); ?>
+    <p><?php echo h(t('field_password', array())); ?>: <code><?php echo h(t('db_password_hidden', array())); ?></code></p>
+    <p><?php echo h(t('db_password_configured', array('value' => $passwordSet ? t('yes', array()) : t('no', array())))); ?></p>
     <?php if ($isInitialized): ?>
       <p class="ok"><?php echo h(t('schema_ready', array())); ?></p>
     <?php else: ?>
