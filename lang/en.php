@@ -76,6 +76,7 @@ return array(
     'pdo_driver_pgsql_ok' => 'pdo_pgsql: available',
     'pdo_driver_pgsql_ng' => 'pdo_pgsql: missing',
     'batch_example' => 'Batch Start Example',
+    'batch_example_docker_note' => 'In Docker setup, the worker service starts automatically, so this cron entry is usually unnecessary.',
     'instance_box' => 'Register Redash Instance',
     'instance_list' => 'Redash Instance List',
     'instance_none' => 'No registered instances.',

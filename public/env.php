@@ -475,6 +475,7 @@ qrs_render_header('env', t('app_title', array()), $message, $error);
 <div class="box">
   <h2><?php echo h(t('batch_example', array())); ?></h2>
   <pre>* * * * * flock -n <?php echo h($workerLockPath); ?> php <?php echo h($workerPath); ?></pre>
+  <p class="muted"><?php echo h(t('batch_example_docker_note', array())); ?></p>
 </div>
 
 <script>

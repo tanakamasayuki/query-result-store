@@ -76,6 +76,7 @@ return array(
     'pdo_driver_pgsql_ok' => 'pdo_pgsql: 利用可能',
     'pdo_driver_pgsql_ng' => 'pdo_pgsql: 未導入',
     'batch_example' => 'Batch 起動例',
+    'batch_example_docker_note' => 'Docker 構成では worker サービスが自動起動するため、通常はこの cron 設定は不要です。',
     'instance_box' => 'Redashインスタンス登録',
     'instance_list' => 'Redashインスタンス一覧',
     'instance_none' => '登録済みインスタンスはありません。',
