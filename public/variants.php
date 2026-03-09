@@ -17,6 +17,7 @@ $queryParamDefs = array();
 $queryMetaOk = false;
 $queryColumnTypes = array();
 $createPreview = null;
+$typeMapDebug = array();
 $editVariantId = isset($_GET['edit_variant_id']) ? trim($_GET['edit_variant_id']) : '';
 $copyVariantId = isset($_GET['copy_variant_id']) ? trim($_GET['copy_variant_id']) : '';
 $editingVariant = null;
@@ -508,6 +509,30 @@ function qrs_build_redash_preview_urls($baseUrl, $queryId, $parameterPreview)
     return $result;
 }
 
+function qrs_build_type_map_debug($baseUrl, $queryId, $params)
+{
+    $result = array();
+    $base = rtrim(trim((string)$baseUrl), '/');
+    $qid = trim((string)$queryId);
+    if ($base === '' || $qid === '') {
+        return $result;
+    }
+    $payload = array(
+        'parameters' => is_array($params) ? $params : array(),
+        'max_age' => 0,
+    );
+    $json = json_encode($payload);
+    if (!is_string($json)) {
+        $json = '{}';
+    }
+
+    $result[] = 'GET ' . $base . '/api/queries/' . $qid . '/results';
+    $result[] = 'POST ' . $base . '/api/queries/' . $qid . '/results (fallback)';
+    $result[] = 'payload: ' . $json . ' (for POST fallback)';
+    $result[] = 'GET ' . $base . '/api/queries/' . $qid;
+    return $result;
+}
+
 function qrs_variant_parameter_lines($parameterJson)
 {
     $lines = array();
@@ -619,12 +644,32 @@ if ($runtimeOk && $dbOk && $isInitialized) {
                         $queryMetaOk = true;
                         $queryParamDefs = qrs_extract_query_params($queryInfo['data']);
                         $queryColumnTypes = qrs_extract_query_column_types($queryInfo['data']);
-                        $defaultParams = qrs_build_default_query_parameters($queryParamDefs);
-                        $previewExec = $client->executeQuery($instance['base_url'], $instance['api_key'], $selectedDataset['query_id'], $defaultParams, 30);
-                        if ($previewExec['ok'] && isset($previewExec['query_result']) && is_array($previewExec['query_result'])) {
-                            $liveColumns = qrs_extract_columns_from_query_result($previewExec['query_result']);
-                            if (count($liveColumns) > 0) {
-                                $queryColumnTypes = $liveColumns;
+                        if (count($queryColumnTypes) === 0) {
+                            $resultsInfo = $client->getQueryResults($instance['base_url'], $instance['api_key'], $selectedDataset['query_id']);
+                            if ($resultsInfo['ok']) {
+                                $resultsColumns = qrs_extract_query_column_types($resultsInfo['data']);
+                                if (count($resultsColumns) > 0) {
+                                    $queryColumnTypes = $resultsColumns;
+                                }
+                            }
+                        }
+                        if (count($queryColumnTypes) === 0) {
+                            $defaultParams = qrs_build_default_query_parameters($queryParamDefs);
+                            $previewExec = $client->executeQuery($instance['base_url'], $instance['api_key'], $selectedDataset['query_id'], $defaultParams, 30);
+                            if ($previewExec['ok']) {
+                                $resultsInfoAfterExec = $client->getQueryResults($instance['base_url'], $instance['api_key'], $selectedDataset['query_id']);
+                                if ($resultsInfoAfterExec['ok']) {
+                                    $resultsColumnsAfterExec = qrs_extract_query_column_types($resultsInfoAfterExec['data']);
+                                    if (count($resultsColumnsAfterExec) > 0) {
+                                        $queryColumnTypes = $resultsColumnsAfterExec;
+                                    }
+                                }
+                                if (count($queryColumnTypes) === 0 && isset($previewExec['query_result']) && is_array($previewExec['query_result'])) {
+                                    $liveColumns = qrs_extract_columns_from_query_result($previewExec['query_result']);
+                                    if (count($liveColumns) > 0) {
+                                        $queryColumnTypes = $liveColumns;
+                                    }
+                                }
                             }
                         }
                     }
@@ -664,7 +709,57 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $runtimeOk && $dbOk) {
         $datasetRepo = new QrsDatasetRepository($pdo);
         $variantRepo = new QrsVariantRepository($pdo);
 
-        if ($action === 'create_variant' || $action === 'validate_variant_create' || $action === 'update_variant_from_editor' || $action === 'validate_variant_update') {
+        if ($action === 'fetch_type_map') {
+            $datasetId = isset($_POST['dataset_id']) ? trim($_POST['dataset_id']) : '';
+            if ($datasetId === '' || $datasetId !== $filterDatasetId) {
+                $error = t('variant_dataset_select_first', array());
+            } else {
+                try {
+                    $instanceRepo = new QrsInstanceRepository($pdo);
+                    $client = new QrsRedashClient();
+                    $selectedDataset = $datasetRepo->findById($datasetId);
+                    if ($selectedDataset === null) {
+                        $error = t('variant_dataset_invalid', array());
+                    } else {
+                        $instance = $instanceRepo->findById($selectedDataset['instance_id']);
+                        if ($instance === null || (int)$instance['is_enabled'] !== 1) {
+                            $error = t('variant_dataset_instance_invalid', array());
+                        } else {
+                            $execParams = qrs_build_default_query_parameters($queryParamDefs);
+                            $typeMapDebug = qrs_build_type_map_debug($instance['base_url'], $selectedDataset['query_id'], $execParams);
+                            $resultsInfo = $client->getQueryResults($instance['base_url'], $instance['api_key'], $selectedDataset['query_id']);
+                            if ($resultsInfo['ok']) {
+                                $resultsColumns = qrs_extract_query_column_types($resultsInfo['data']);
+                                if (count($resultsColumns) > 0) {
+                                    $queryColumnTypes = $resultsColumns;
+                                    $message = t('variant_type_map_fetch_ok', array('count' => count($resultsColumns)));
+                                }
+                            }
+                            if (count($queryColumnTypes) === 0) {
+                                $exec = $client->executeQuery($instance['base_url'], $instance['api_key'], $selectedDataset['query_id'], $execParams, 15);
+                                if (!$exec['ok']) {
+                                    $error = t('variant_type_map_fetch_error', array('message' => $exec['message']));
+                                } else {
+                                    $resultsInfoAfterExec = $client->getQueryResults($instance['base_url'], $instance['api_key'], $selectedDataset['query_id']);
+                                    if ($resultsInfoAfterExec['ok']) {
+                                        $resultsColumnsAfterExec = qrs_extract_query_column_types($resultsInfoAfterExec['data']);
+                                        if (count($resultsColumnsAfterExec) > 0) {
+                                            $queryColumnTypes = $resultsColumnsAfterExec;
+                                            $message = t('variant_type_map_fetch_ok', array('count' => count($resultsColumnsAfterExec)));
+                                        }
+                                    }
+                                }
+                            }
+                            if ($error === '' && count($queryColumnTypes) === 0) {
+                                $error = t('variant_preview_type_map_none', array());
+                            }
+                        }
+                    }
+                } catch (Exception $e) {
+                    $error = t('variant_type_map_fetch_error', array('message' => $e->getMessage()));
+                }
+            }
+        } elseif ($action === 'create_variant' || $action === 'validate_variant_create' || $action === 'update_variant_from_editor' || $action === 'validate_variant_update') {
             $datasetId = isset($_POST['dataset_id']) ? trim($_POST['dataset_id']) : '';
             $mode = isset($_POST['mode']) ? trim($_POST['mode']) : '';
             $isEnabled = isset($_POST['is_enabled']) && $_POST['is_enabled'] === '1';
@@ -1054,6 +1149,15 @@ qrs_render_header('variants', t('app_title', array()), $message, $error);
           <h3><?php echo h(t('variant_type_override', array())); ?></h3>
           <?php if (count($queryColumnTypes) === 0): ?>
             <p class="muted"><?php echo h(t('variant_preview_type_map_none', array())); ?></p>
+            <div style="margin-top:10px;">
+              <button type="submit" name="action" value="fetch_type_map"><?php echo h(t('variant_type_map_fetch_button', array())); ?></button>
+            </div>
+            <?php if (count($typeMapDebug) > 0): ?>
+              <p class="muted"><?php echo h(t('variant_type_map_debug_title', array())); ?></p>
+              <?php foreach ($typeMapDebug as $line): ?>
+                <div><code><?php echo h($line); ?></code></div>
+              <?php endforeach; ?>
+            <?php endif; ?>
           <?php else: ?>
             <?php if ($isEditMode): ?>
               <p class="muted"><?php echo h(t('variant_type_override_locked_note', array())); ?></p>

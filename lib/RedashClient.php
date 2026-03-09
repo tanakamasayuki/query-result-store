@@ -2,6 +2,37 @@
 
 class QrsRedashClient
 {
+    private function httpErrorMessage($prefix, $statusCode, $body)
+    {
+        $base = $prefix . ' (HTTP ' . (string)$statusCode . ')';
+        $raw = trim((string)$body);
+        if ($raw === '') {
+            return $base;
+        }
+
+        if (function_exists('json_decode')) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                if (isset($decoded['message']) && is_string($decoded['message']) && trim($decoded['message']) !== '') {
+                    return $base . ': ' . trim($decoded['message']);
+                }
+                if (isset($decoded['job']) && is_array($decoded['job'])) {
+                    if (isset($decoded['job']['error']) && is_string($decoded['job']['error']) && trim($decoded['job']['error']) !== '') {
+                        return $base . ': ' . trim($decoded['job']['error']);
+                    }
+                    if (isset($decoded['job']['status']) && (int)$decoded['job']['status'] === 4 && isset($decoded['job']['result']) && is_string($decoded['job']['result']) && trim($decoded['job']['result']) !== '') {
+                        return $base . ': ' . trim($decoded['job']['result']);
+                    }
+                }
+            }
+        }
+
+        if (strlen($raw) > 180) {
+            $raw = substr($raw, 0, 180) . '...';
+        }
+        return $base . ': ' . $raw;
+    }
+
     public function testConnection($baseUrl, $apiKey)
     {
         $result = $this->request($baseUrl, $apiKey, '/api/queries?page=1&page_size=1');
@@ -75,6 +106,37 @@ class QrsRedashClient
         return array('ok' => true, 'status_code' => $statusCode, 'message' => 'Query details fetched.', 'data' => $data);
     }
 
+    public function getQueryResults($baseUrl, $apiKey, $queryId)
+    {
+        $queryId = trim((string)$queryId);
+        if ($queryId === '' || !preg_match('/^[0-9]+$/', $queryId)) {
+            return array('ok' => false, 'status_code' => 0, 'message' => 'Invalid query_id.');
+        }
+
+        $result = $this->request($baseUrl, $apiKey, '/api/queries/' . $queryId . '/results');
+        $statusCode = $result['status_code'];
+        if ($statusCode < 200 || $statusCode >= 300) {
+            if ($statusCode === 404) {
+                return array('ok' => false, 'status_code' => $statusCode, 'message' => 'Query result not found.');
+            }
+            if ($statusCode === 401 || $statusCode === 403) {
+                return array('ok' => false, 'status_code' => $statusCode, 'message' => 'Authentication failed (invalid API key or insufficient permission).');
+            }
+            return array('ok' => false, 'status_code' => $statusCode, 'message' => $this->httpErrorMessage('Failed to fetch query results', $statusCode, isset($result['body']) ? $result['body'] : ''));
+        }
+
+        if (!function_exists('json_decode')) {
+            return array('ok' => false, 'status_code' => $statusCode, 'message' => 'json extension is required.');
+        }
+
+        $data = json_decode($result['body'], true);
+        if (!is_array($data)) {
+            return array('ok' => false, 'status_code' => $statusCode, 'message' => 'Invalid JSON response from Redash query results API.');
+        }
+
+        return array('ok' => true, 'status_code' => $statusCode, 'message' => 'Query results fetched.', 'data' => $data);
+    }
+
     public function executeQuery($baseUrl, $apiKey, $queryId, $parameters, $maxWaitSeconds, $pollIntervalMillis = 500)
     {
         $queryId = trim((string)$queryId);
@@ -105,7 +167,7 @@ class QrsRedashClient
         $postResult = $this->request($baseUrl, $apiKey, '/api/queries/' . $queryId . '/results', 'POST', $payloadJson, array('Content-Type: application/json'));
         $statusCode = $postResult['status_code'];
         if ($statusCode < 200 || $statusCode >= 300) {
-            return array('ok' => false, 'status_code' => $statusCode, 'message' => 'Failed to execute query.');
+            return array('ok' => false, 'status_code' => $statusCode, 'message' => $this->httpErrorMessage('Failed to execute query', $statusCode, isset($postResult['body']) ? $postResult['body'] : ''));
         }
 
         if (!function_exists('json_decode')) {
@@ -142,7 +204,7 @@ class QrsRedashClient
 
             $jobResult = $this->request($baseUrl, $apiKey, '/api/jobs/' . $jobId);
             if ($jobResult['status_code'] < 200 || $jobResult['status_code'] >= 300) {
-                return array('ok' => false, 'status_code' => $jobResult['status_code'], 'message' => 'Failed to fetch execution job status.');
+                return array('ok' => false, 'status_code' => $jobResult['status_code'], 'message' => $this->httpErrorMessage('Failed to fetch execution job status', $jobResult['status_code'], isset($jobResult['body']) ? $jobResult['body'] : ''));
             }
             $jobData = json_decode($jobResult['body'], true);
             if (!is_array($jobData) || !isset($jobData['job']) || !is_array($jobData['job'])) {
@@ -161,7 +223,7 @@ class QrsRedashClient
                 }
                 $qrResult = $this->request($baseUrl, $apiKey, '/api/query_results/' . $qrId);
                 if ($qrResult['status_code'] < 200 || $qrResult['status_code'] >= 300) {
-                    return array('ok' => false, 'status_code' => $qrResult['status_code'], 'message' => 'Failed to fetch query result.');
+                    return array('ok' => false, 'status_code' => $qrResult['status_code'], 'message' => $this->httpErrorMessage('Failed to fetch query result', $qrResult['status_code'], isset($qrResult['body']) ? $qrResult['body'] : ''));
                 }
                 $qrData = json_decode($qrResult['body'], true);
                 if (!is_array($qrData) || !isset($qrData['query_result']) || !is_array($qrData['query_result'])) {
@@ -178,7 +240,7 @@ class QrsRedashClient
             }
 
             if ($jobStatus === 4 || $jobStatus === 5) {
-                return array('ok' => false, 'status_code' => $jobResult['status_code'], 'message' => 'Execution job failed.');
+                return array('ok' => false, 'status_code' => $jobResult['status_code'], 'message' => $this->httpErrorMessage('Execution job failed', $jobResult['status_code'], isset($jobResult['body']) ? $jobResult['body'] : ''));
             }
 
             usleep($pollInterval * 1000);
