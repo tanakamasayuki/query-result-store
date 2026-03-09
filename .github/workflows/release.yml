@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version input
+        run: |
+          set -eu
+          VERSION="${{ github.event.inputs.version }}"
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z._-]+)?$'
+
+      - name: Update version.php and CHANGELOG.md
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -eu
+
+          # Update version.php
+          cat > version.php <<PHP
+          <?php
+
+          return '${VERSION}';
+          PHP
+
+          if ! grep -q '^## Unreleased$' CHANGELOG.md; then
+            echo "CHANGELOG.md must contain '## Unreleased' section." >&2
+            exit 1
+          fi
+
+          # Extract bullet lines under Unreleased (until next section)
+          awk '
+            BEGIN {in_unrel=0}
+            /^## Unreleased$/ {in_unrel=1; next}
+            in_unrel && /^## / {exit}
+            in_unrel {print}
+          ' CHANGELOG.md > /tmp/unreleased_body.txt
+
+          if ! grep -q '^[[:space:]]*-' /tmp/unreleased_body.txt; then
+            echo "Unreleased section has no release notes bullets." >&2
+            exit 1
+          fi
+
+          # Preserve content before Unreleased header
+          awk '
+            /^## Unreleased$/ {exit}
+            {print}
+          ' CHANGELOG.md > /tmp/changelog_prefix.txt
+
+          # Preserve sections after Unreleased section
+          awk '
+            BEGIN {in_unrel=0; after=0}
+            /^## Unreleased$/ {in_unrel=1; next}
+            in_unrel && /^## / {after=1}
+            after {print}
+          ' CHANGELOG.md > /tmp/changelog_suffix.txt
+
+          # Rewrite changelog:
+          # - keep Unreleased section empty
+          # - add new version section with former Unreleased bullets
+          {
+            cat /tmp/changelog_prefix.txt
+            printf '\n'
+            printf '## Unreleased\n\n'
+            printf '## %s\n' "$VERSION"
+            cat /tmp/unreleased_body.txt
+            if [ -s /tmp/changelog_suffix.txt ]; then
+              printf '\n'
+              cat /tmp/changelog_suffix.txt
+            fi
+          } > /tmp/CHANGELOG.md.new
+
+          mv /tmp/CHANGELOG.md.new CHANGELOG.md
+
+          # Release body
+          {
+            printf '## %s\n' "$VERSION"
+            cat /tmp/unreleased_body.txt
+          } > /tmp/release_body.md
+
+      - name: Commit and push release files
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.php CHANGELOG.md
+          git commit -m "release: ${VERSION}"
+          git push
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: ${{ github.event.inputs.version }}
+          body_path: /tmp/release_body.md
