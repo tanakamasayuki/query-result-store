@@ -99,7 +99,20 @@ jobs:
             fi
           } > /tmp/CHANGELOG.md.new
 
-          mv /tmp/CHANGELOG.md.new CHANGELOG.md
+          # Normalize: collapse 2+ consecutive blank lines to a single blank line
+          awk '
+            BEGIN {blank=0}
+            /^[[:space:]]*$/ {
+              if (blank == 0) {
+                print ""
+              }
+              blank=1
+              next
+            }
+            { blank=0; print }
+          ' /tmp/CHANGELOG.md.new > /tmp/CHANGELOG.md.normalized
+
+          mv /tmp/CHANGELOG.md.normalized CHANGELOG.md
 
           # Release body
           {
