@@ -497,6 +497,18 @@ function qrs_worker_recover_stale_running($pdo, $staleSeconds)
     return $count;
 }
 
+function qrs_worker_count_running_buckets($pdo)
+{
+    $sql = 'SELECT COUNT(*) AS c FROM qrs_sys_buckets WHERE status = :status';
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute(array(':status' => 'running'));
+    $row = $stmt->fetch();
+    if (!$row || !isset($row['c'])) {
+        return 0;
+    }
+    return (int)$row['c'];
+}
+
 function qrs_worker_new_run_id()
 {
     $rand = '';
@@ -799,6 +811,19 @@ try {
     }
 } catch (Exception $e) {
     fwrite(STDERR, '[qrs-worker] stale recovery failed: ' . $e->getMessage() . "\n");
+}
+
+if (!$isChildMode) {
+    try {
+        $runningCount = qrs_worker_count_running_buckets($pdo);
+        if ($runningCount > 0) {
+            fwrite(STDERR, '[qrs-worker] running buckets still exist after stale recovery: ' . $runningCount . '. Abort to avoid overlapping execution.' . "\n");
+            exit(1);
+        }
+    } catch (Exception $e) {
+        fwrite(STDERR, '[qrs-worker] running bucket safety check failed: ' . $e->getMessage() . "\n");
+        exit(1);
+    }
 }
 
 // Phase 1: dispatch-equivalent tasks.
