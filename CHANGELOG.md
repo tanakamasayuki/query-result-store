@@ -1,6 +1,8 @@
 # Changelog / 変更履歴
 
 ## Unreleased
+
+## 1.0.1
 - (EN) Improved Variant Column Type Override flow: keep auto execute on page load, prioritize `GET /api/queries/{id}/results` for type map fetch, and improve Redash API error detail messages.
 - (JA) Variant の列型 Override フローを改善: 画面表示時の自動実行を維持しつつ、型取得は `GET /api/queries/{id}/results` 優先に変更。Redash API エラー詳細の表示も改善。
 - (EN) Added Docker operation notes in Environment UI and expanded README (EN/JA), including Web server deployment guidance.
