@@ -60,6 +60,18 @@ Minimal implementation skeleton for the QRS requirements.
    docker compose exec web php bin/worker.php
    ```
 
+   Or run continuous worker service (minimal polling loop):
+
+   ```bash
+   docker compose up -d worker
+   ```
+
+   Default loop interval is `15` seconds. To change:
+
+   ```bash
+   WORKER_LOOP_SECONDS=2 docker compose up -d worker
+   ```
+
 4. Configure DB by environment variables (`docker-compose.yml`):
    - `QRS_DB_DRIVER`: `sqlite` / `mysql` / `pgsql`
    - `QRS_DB_SQLITE_PATH`: sqlite file path in container (example: `/var/www/html/var/qrs.sqlite3`)
