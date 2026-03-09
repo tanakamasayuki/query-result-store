@@ -60,6 +60,36 @@ Minimal implementation skeleton for the QRS requirements.
    docker compose exec web php bin/worker.php
    ```
 
+4. Configure DB by environment variables (`docker-compose.yml`):
+   - `QRS_DB_DRIVER`: `sqlite` / `mysql` / `pgsql`
+   - `QRS_DB_SQLITE_PATH`: sqlite file path in container (example: `/var/www/html/var/qrs.sqlite3`)
+   - `QRS_DB_HOST`, `QRS_DB_PORT`, `QRS_DB_NAME`, `QRS_DB_USER`, `QRS_DB_PASSWORD`, `QRS_DB_CHARSET`
+
+   Examples:
+
+   ```yaml
+   # sqlite
+   QRS_DB_DRIVER: sqlite
+   QRS_DB_SQLITE_PATH: /var/www/html/var/qrs.sqlite3
+
+   # mysql
+   QRS_DB_DRIVER: mysql
+   QRS_DB_HOST: mysql
+   QRS_DB_PORT: "3306"
+   QRS_DB_NAME: qrs
+   QRS_DB_USER: qrs
+   QRS_DB_PASSWORD: qrs
+   QRS_DB_CHARSET: utf8mb4
+
+   # pgsql
+   QRS_DB_DRIVER: pgsql
+   QRS_DB_HOST: postgres
+   QRS_DB_PORT: "5432"
+   QRS_DB_NAME: qrs
+   QRS_DB_USER: qrs
+   QRS_DB_PASSWORD: qrs
+   ```
+
 ## Notes
 
 - Single worker entrypoint: `bin/worker.php`
