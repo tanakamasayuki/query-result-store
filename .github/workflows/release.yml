@@ -61,7 +61,21 @@ jobs:
           awk '
             /^## Unreleased$/ {exit}
             {print}
-          ' CHANGELOG.md > /tmp/changelog_prefix.txt
+          ' CHANGELOG.md > /tmp/changelog_prefix_raw.txt
+
+          # Trim trailing blank lines in prefix
+          awk '
+            { lines[NR] = $0 }
+            END {
+              last = NR
+              while (last > 0 && lines[last] ~ /^[[:space:]]*$/) {
+                last--
+              }
+              for (i = 1; i <= last; i++) {
+                print lines[i]
+              }
+            }
+          ' /tmp/changelog_prefix_raw.txt > /tmp/changelog_prefix.txt
 
           # Preserve sections after Unreleased section
           awk '
@@ -76,8 +90,7 @@ jobs:
           # - add new version section with former Unreleased bullets
           {
             cat /tmp/changelog_prefix.txt
-            printf '\n'
-            printf '## Unreleased\n\n'
+            printf '\n## Unreleased\n\n'
             printf '## %s\n' "$VERSION"
             cat /tmp/unreleased_body.txt
             if [ -s /tmp/changelog_suffix.txt ]; then
